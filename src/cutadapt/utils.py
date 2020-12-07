@@ -3,9 +3,20 @@ import sys
 import time
 import errno
 import multiprocessing
+import logging
+from typing import Optional
 
 from xopen import xopen
 import dnaio
+
+try:
+    import resource
+except ImportError:
+    # Windows
+    resource = None  # type: ignore
+
+
+logger = logging.getLogger(__name__)
 
 
 def available_cpu_count():
@@ -25,20 +36,17 @@ def available_cpu_count():
             res = bin(int(m.group(1).replace(",", ""), 16)).count("1")
             if res > 0:
                 return min(res, multiprocessing.cpu_count())
-    except IOError:
+    except OSError:
         pass
 
     return multiprocessing.cpu_count()
 
 
 def raise_open_files_limit(n):
-    try:
-        import resource
-    except ImportError:
-        # Windows
+    if resource is None:
         return
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    soft += n
+    soft = min(soft + n, hard)
     resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
@@ -86,8 +94,6 @@ class Progress:
         if not _final:
             if time_delta < self._every:
                 return
-            if total <= self._n:
-                return
 
         t = current_time - self._start_time
         hours = int(t) // 3600
@@ -117,9 +123,9 @@ class Progress:
         print(file=sys.stderr)
 
 
-class DummyProgress:
+class DummyProgress(Progress):
     """
-    Has the same interface as Progress, but does not print anything
+    Does not print anything
     """
     def update(self, total, _final=False):
         pass
@@ -148,27 +154,49 @@ def reverse_complemented_sequence(sequence: dnaio.Sequence):
 
 class FileOpener:
     def __init__(self, compression_level: int = 6, threads: int = None):
+        """
+        threads -- no. of external compression threads.
+            0: write in-process
+            None: min(cpu_count(0, 4)
+        """
         self.compression_level = compression_level
         self.threads = threads
 
     def xopen(self, path, mode):
+        logger.debug("Opening file '%s', mode '%s' with xopen", path, mode)
         return xopen(path, mode, compresslevel=self.compression_level, threads=self.threads)
 
+    def xopen_or_none(self, path, mode):
+        """Return opened file or None if the path is None"""
+        if path is None:
+            return None
+        return self.xopen(path, mode)
+
+    def xopen_pair(self, path1: str, path2: Optional[str], mode):
+        if path1 is None and path2 is not None:
+            raise ValueError("When giving paths for paired-end files, only providing the second"
+                " file is not supported")
+        file1 = self.xopen_or_none(path1, mode)
+        file2 = self.xopen_or_none(path2, mode)
+        return file1, file2
+
     def dnaio_open(self, *args, **kwargs):
+        logger.debug("Opening file '%s', mode '%s' with dnaio", args[0], kwargs['mode'])
         kwargs["opener"] = self.xopen
         return dnaio.open(*args, **kwargs)
 
-    def dnaio_open_raise_limit(self, path, qualities):
+    def dnaio_open_raise_limit(self, *args, **kwargs):
         """
         Open a FASTA/FASTQ file for writing. If it fails because the number of open files
         would be exceeded, try to raise the soft limit and re-try.
         """
         try:
-            f = self.dnaio_open(path, mode="w", qualities=qualities)
+            f = self.dnaio_open(*args, **kwargs)
         except OSError as e:
             if e.errno == errno.EMFILE:  # Too many open files
+                logger.debug("Too many open files, attempting to raise soft limit")
                 raise_open_files_limit(8)
-                f = self.dnaio_open(path, mode="w", qualities=qualities)
+                f = self.dnaio_open(*args, **kwargs)
             else:
                 raise
         return f

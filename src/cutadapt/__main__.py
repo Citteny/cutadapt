@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright (c) 2010-2019 Marcel Martin <marcel.martin@scilifelab.se>
+# Copyright (c) 2010-2020 Marcel Martin <marcel.martin@scilifelab.se>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -23,7 +23,7 @@
 """
 cutadapt version {version}
 
-Copyright (C) 2010-2019 Marcel Martin <marcel.martin@scilifelab.se>
+Copyright (C) 2010-2020 Marcel Martin <marcel.martin@scilifelab.se>
 
 cutadapt removes adapter sequences from high-throughput sequencing reads.
 
@@ -34,11 +34,10 @@ For paired-end reads:
     cutadapt -a ADAPT1 -A ADAPT2 [options] -o out1.fastq -p out2.fastq in1.fastq in2.fastq
 
 Replace "ADAPTER" with the actual sequence of your 3' adapter. IUPAC wildcard
-characters are supported. The reverse complement is *not* automatically
-searched. All reads from input.fastq will be written to output.fastq with the
-adapter sequence removed. Adapter matching is error-tolerant. Multiple adapter
-sequences can be given (use further -a options), but only the best-matching
-adapter will be removed.
+characters are supported. All reads from input.fastq will be written to
+output.fastq with the adapter sequence removed. Adapter matching is
+error-tolerant. Multiple adapter sequences can be given (use further -a
+options), but only the best-matching adapter will be removed.
 
 Input may also be in FASTA format. Compressed input and output is supported and
 auto-detected from the file name (.gz, .xz, .bz2). Use the file name '-' for
@@ -58,19 +57,22 @@ import sys
 import time
 import logging
 import platform
+import itertools
+from typing import Tuple, Optional, Sequence, List, Any, Iterator, Union
 from argparse import ArgumentParser, SUPPRESS, HelpFormatter
 
 import dnaio
 
 from cutadapt import __version__
-from cutadapt.adapters import warn_duplicate_adapters
+from cutadapt.adapters import warn_duplicate_adapters, Adapter, InvalidCharacter
 from cutadapt.parser import AdapterParser
-from cutadapt.modifiers import (LengthTagModifier, SuffixRemover, PrefixSuffixAdder,
+from cutadapt.modifiers import (SingleEndModifier, LengthTagModifier, SuffixRemover, PrefixSuffixAdder,
     ZeroCapper, QualityTrimmer, UnconditionalCutter, NEndTrimmer, AdapterCutter,
-    PairedAdapterCutterError, PairedAdapterCutter, NextseqQualityTrimmer, Shortener)
-from cutadapt.report import full_report, minimal_report
-from cutadapt.pipeline import (SingleEndPipeline, PairedEndPipeline, InputFiles, OutputFiles,
-    SerialPipelineRunner, ParallelPipelineRunner)
+    PairedAdapterCutterError, PairedAdapterCutter, NextseqQualityTrimmer, Shortener,
+    ReverseComplementer)
+from cutadapt.report import full_report, minimal_report, Statistics
+from cutadapt.pipeline import (Pipeline, SingleEndPipeline, PairedEndPipeline, InputPaths,
+    OutputFiles, PipelineRunner, SerialPipelineRunner, ParallelPipelineRunner)
 from cutadapt.utils import available_cpu_count, Progress, DummyProgress, FileOpener
 from cutadapt.log import setup_logging, REPORT
 
@@ -84,6 +86,14 @@ class CutadaptArgumentParser(ArgumentParser):
     - A brief message is shown on errors, not full usage
     """
     class CustomUsageHelpFormatter(HelpFormatter):
+        def __init__(self, *args, **kwargs):
+            try:
+                import shutil
+                kwargs['width'] = min(24 + 80, shutil.get_terminal_size().columns)
+            except ImportError:
+                pass
+            super().__init__(*args, **kwargs)
+
         def add_usage(self, usage, actions, groups, prefix=None):
             if usage is not SUPPRESS:
                 args = usage, actions, groups, ''
@@ -108,15 +118,15 @@ class CommandLineError(Exception):
     pass
 
 
-def get_argument_parser():
+def get_argument_parser() -> ArgumentParser:
     # noqa: E131
     parser = CutadaptArgumentParser(usage=__doc__, add_help=False)
     group = parser.add_argument_group("Options")
     group.add_argument("-h", "--help", action="help", help="Show this help message and exit")
     group.add_argument("--version", action="version", help="Show version number and exit",
         version=__version__)
-    group.add_argument("--debug", action='store_true', default=False,
-        help="Print debugging information.")
+    group.add_argument("--debug", action="count", default=0,
+        help="Print debug log. Use twice to also print DP matrices")
     group.add_argument("--profile", action="store_true", default=False, help=SUPPRESS)
     group.add_argument('-j', '--cores', type=int, default=1,
         help='Number of CPU cores to use. Use 0 to auto-detect. Default: %(default)s')
@@ -129,10 +139,10 @@ def get_argument_parser():
     group.add_argument("--buffer-size", type=int, default=4000000,
         help=SUPPRESS)
     # Compression level for gzipped output files. Not exposed since we have -Z
-    group.add_argument("--compression-level", type=int, default=6,
+    group.add_argument("--compression-level", type=int, default=5,
         help=SUPPRESS)
-    # Deprecated: The input format is always auto-detected
-    group.add_argument("-f", "--format", help=SUPPRESS)
+    # Disable adapter index creation
+    group.add_argument("--no-index", dest="index", default=True, action="store_false", help=SUPPRESS)
 
     group = parser.add_argument_group("Finding adapters",
         description="Parameters -a, -g, -b specify adapters to be removed from "
@@ -158,14 +168,16 @@ def get_argument_parser():
         default=[], metavar="ADAPTER", dest="adapters",
         help="Sequence of an adapter that may be ligated to the 5' or 3' end "
             "(paired data: of the first read). Both types of matches as "
-            "described under -a und -g are allowed. If the first base of the "
+            "described under -a and -g are allowed. If the first base of the "
             "read is part of the match, the behavior is as with -g, otherwise "
             "as with -a. This option is mostly for rescuing failed library "
             "preparations - do not use if you know which end your adapter was "
             "ligated to!")
-    group.add_argument("-e", "--error-rate", type=float, default=0.1, metavar="RATE",
-        help="Maximum allowed error rate as value between 0 and 1 (no. of "
-            "errors divided by length of matching region). Default: %(default)s (=10%%)")
+    group.add_argument("-e", "--error-rate", "--errors",
+        type=float, metavar="E", default=0.1,
+        help="Maximum allowed error rate (if 0 <= E < 1), or absolute number of errors "
+            "for full-length adapter match (if E is an integer >= 1). Error rate = "
+            "no. of errors divided by length of matching region. Default: %(default)s (10%%)")
     group.add_argument("--no-indels", action='store_false', dest='indels', default=True,
         help="Allow only mismatches in alignments. "
             "Default: allow both mismatches and indels")
@@ -179,12 +191,19 @@ def get_argument_parser():
     group.add_argument("-N", "--no-match-adapter-wildcards", action="store_false",
         default=True, dest='match_adapter_wildcards',
         help="Do not interpret IUPAC wildcards in adapters.")
-    group.add_argument("--action", choices=('trim', 'mask', 'lowercase', 'none'), default='trim',
-        help="What to do with found adapters. "
+    group.add_argument("--action", choices=("trim", "retain", "mask", "lowercase", "none"),
+        default="trim",
+        help="What to do if a match was found. "
+            "trim: trim adapter and up- or downstream sequence; "
+            "retain: trim, but retain adapter; "
             "mask: replace with 'N' characters; "
             "lowercase: convert to lowercase; "
-            "none: leave unchanged (useful with "
-            "--discard-untrimmed). Default: %(default)s")
+            "none: leave unchanged. Default: %(default)s")
+    group.add_argument("--rc", "--revcomp", dest="reverse_complement", default=False,
+        action="store_true",
+        help="Check both the read and its reverse complement for adapter matches. If "
+            "match is on reverse-complemented version, output that one. "
+            "Default: check only read")
     group.add_argument("--no-trim", dest='action', action='store_const', const='none',
         help=SUPPRESS)  # Deprecated, use --action=none
     group.add_argument("--mask-adapter", dest='action', action='store_const', const='mask',
@@ -242,6 +261,10 @@ def get_argument_parser():
     group.add_argument("--max-n", type=float, default=None, metavar="COUNT",
         help="Discard reads with more than COUNT 'N' bases. If COUNT is a number "
              "between 0 and 1, it is interpreted as a fraction of the read length.")
+    group.add_argument("--max-expected-errors", "--max-ee", type=float, default=None,
+        metavar="ERRORS",
+        help="Discard reads whose expected number of errors (computed "
+            "from quality values) exceeds ERRORS.")
     group.add_argument("--discard-trimmed", "--discard", action='store_true', default=False,
         help="Discard reads that contain an adapter. Use also -O to avoid "
             "discarding too many randomly matching reads.")
@@ -310,23 +333,15 @@ def get_argument_parser():
             "filtering criterion in order for the pair to be filtered. "
             "Default: any")
     group.add_argument("--interleaved", action='store_true', default=False,
-        help="Read and write interleaved paired-end reads.")
+        help="Read and/or write interleaved paired-end reads.")
     group.add_argument("--untrimmed-paired-output", metavar="FILE",
         help="Write second read in a pair to this FILE when no adapter "
             "was found. Use with --untrimmed-output. Default: output "
             "to same file as trimmed reads")
     group.add_argument("--too-short-paired-output", metavar="FILE", default=None,
-        help="Write second read in a pair to this file if pair is too short. "
-            "Use also --too-short-output.")
+        help="Write second read in a pair to this file if pair is too short.")
     group.add_argument("--too-long-paired-output", metavar="FILE", default=None,
-        help="Write second read in a pair to this file if pair is too long. "
-            "Use also --too-long-output.")
-
-    for arg in ("--colorspace", "-c", "-d", "--double-encode", "-t", "--trim-primer",
-            "--strip-f3", "--maq", "--bwa", "--no-zero-cap"):
-        group.add_argument(arg, dest='colorspace', action='store_true', default=False,
-        help=SUPPRESS)
-    parser.set_defaults(colorspace=False)
+        help="Write second read in a pair to this file if pair is too long.")
 
     # We could have two positional arguments here, with the second one optional, but
     # we want custom, more helpful error messages.
@@ -335,13 +350,13 @@ def get_argument_parser():
     return parser
 
 
-def parse_cutoffs(s):
-    """Parse a string INT[,INT] into a two-element list of integers
+def parse_cutoffs(s: str) -> Tuple[int, int]:
+    """Parse a string INT[,INT] into a pair of integers
 
     >>> parse_cutoffs("5")
-    [0, 5]
+    (0, 5)
     >>> parse_cutoffs("6,7")
-    [6, 7]
+    (6, 7)
     """
     try:
         cutoffs = [int(value) for value in s.split(",")]
@@ -353,10 +368,11 @@ def parse_cutoffs(s):
     elif len(cutoffs) != 2:
         raise CommandLineError("Expected one value or two values separated by comma for "
             "the quality cutoff")
-    return cutoffs
+
+    return (cutoffs[0], cutoffs[1])
 
 
-def parse_lengths(s):
+def parse_lengths(s: str) -> Tuple[Optional[int], ...]:
     """Parse [INT][:[INT]] into a pair of integers. If a value is omitted, use None
 
     >>> parse_lengths('25')
@@ -380,96 +396,55 @@ def parse_lengths(s):
     return tuple(values)
 
 
-def open_output_files(args, default_outfile, interleaved, file_opener):
+def open_output_files(
+    args, default_outfile, file_opener: FileOpener, adapter_names: Sequence[str], adapter_names2: Sequence[str],
+) -> OutputFiles:
     """
     Return an OutputFiles instance. If demultiplex is True, the untrimmed, untrimmed2, out and out2
     attributes are not opened files, but paths (out and out2 with the '{name}' template).
     """
 
-    def open1(path):
-        """Return opened file (or None if path is None)"""
-        if path is None:
-            return None
-        return file_opener.xopen(path, "wb")
-
-    def open2(path1, path2):
-        file1 = file2 = None
-        if path1 is not None:
-            file1 = file_opener.xopen(path1, "wb")
-            if path2 is not None:
-                file2 = file_opener.xopen(path2, "wb")
-        return file1, file2
-
-    rest_file = open1(args.rest_file)
-    info_file = open1(args.info_file)
-    wildcard = open1(args.wildcard_file)
+    rest_file = file_opener.xopen_or_none(args.rest_file, "wb")
+    info_file = file_opener.xopen_or_none(args.info_file, "wb")
+    wildcard = file_opener.xopen_or_none(args.wildcard_file, "wb")
 
     too_short = too_short2 = None
     if args.minimum_length is not None:
-        too_short, too_short2 = open2(args.too_short_output, args.too_short_paired_output)
+        too_short, too_short2 = file_opener.xopen_pair(
+            args.too_short_output, args.too_short_paired_output, "wb")
 
     too_long = too_long2 = None
     if args.maximum_length is not None:
-        too_long, too_long2 = open2(args.too_long_output, args.too_long_paired_output)
+        too_long, too_long2 = file_opener.xopen_pair(
+            args.too_long_output, args.too_long_paired_output, "wb")
 
     if int(args.discard_trimmed) + int(args.discard_untrimmed) + int(
             args.untrimmed_output is not None) > 1:
         raise CommandLineError("Only one of the --discard-trimmed, --discard-untrimmed "
             "and --untrimmed-output options can be used at the same time.")
 
-    demultiplex = args.output is not None and '{name}' in args.output
-
-    if args.paired_output is not None and (demultiplex != ('{name}' in args.paired_output)):
-        raise CommandLineError('When demultiplexing paired-end data, "{name}" must appear in '
-            'both output file names (-o and -p)')
-
-    demultiplex_combinatorial = (
-        args.output is not None
-        and args.paired_output is not None
-        and '{name1}' in args.output
-        and '{name2}' in args.output
-        and '{name1}' in args.paired_output
-        and '{name2}' in args.paired_output
-    )
-    if (demultiplex or demultiplex_combinatorial) and args.discard_trimmed:
+    demultiplex_mode = determine_demultiplex_mode(args)
+    if demultiplex_mode and args.discard_trimmed:
         raise CommandLineError("Do not use --discard-trimmed when demultiplexing.")
 
-    if demultiplex:
-        if demultiplex_combinatorial:
-            raise CommandLineError("You cannot combine {name} with {name1} and {name2}")
-
-        out = args.output
-        untrimmed = args.output.replace('{name}', 'unknown')
-        if args.untrimmed_output:
-            untrimmed = args.untrimmed_output
-        if args.discard_untrimmed:
-            untrimmed = None
-
-        if args.paired_output is not None:
-            out2 = args.paired_output
-            untrimmed2 = args.paired_output.replace('{name}', 'unknown')
-            if args.untrimmed_paired_output:
-                untrimmed2 = args.untrimmed_paired_output
-            if args.discard_untrimmed:
-                untrimmed2 = None
-
-        else:
-            untrimmed2 = out2 = None
-
-        assert out is not None and '{name}' in out and (out2 is None or '{name}' in out2)
-    elif demultiplex_combinatorial:
-        out = args.output
-        out2 = args.paired_output
-        if args.untrimmed_output or args.untrimmed_paired_output:
-            raise CommandLineError("Combinatorial demultiplexing (with {name1} and {name2})"
-                " cannot be combined with --untrimmed-output or --untrimmed-paired-output")
-        if args.discard_untrimmed:
-            untrimmed = untrimmed2 = None
-        else:
-            untrimmed = untrimmed2 = 'unknown'
+    if demultiplex_mode == "normal":
+        out = out2 = None
+        combinatorial_out = combinatorial_out2 = None
+        demultiplex_out, demultiplex_out2, untrimmed, untrimmed2 = open_demultiplex_out(
+            adapter_names, args, file_opener)
+    elif demultiplex_mode == "combinatorial":
+        assert '{name1}' in args.output and '{name2}' in args.output
+        assert '{name1}' in args.paired_output and '{name2}' in args.paired_output
+        out = out2 = None
+        demultiplex_out = demultiplex_out2 = None
+        combinatorial_out, combinatorial_out2, untrimmed, untrimmed2 = open_combinatorial_out(
+            adapter_names, adapter_names2, args, file_opener)
     else:
-        untrimmed, untrimmed2 = open2(args.untrimmed_output, args.untrimmed_paired_output)
-        out, out2 = open2(args.output, args.paired_output)
+        combinatorial_out = combinatorial_out2 = None
+        demultiplex_out = demultiplex_out2 = None
+        untrimmed, untrimmed2 = file_opener.xopen_pair(
+            args.untrimmed_output, args.untrimmed_paired_output, "wb")
+        out, out2 = file_opener.xopen_pair(args.output, args.paired_output, "wb")
         if out is None:
             out = default_outfile
 
@@ -485,13 +460,96 @@ def open_output_files(args, default_outfile, interleaved, file_opener):
         untrimmed2=untrimmed2,
         out=out,
         out2=out2,
-        demultiplex=demultiplex or demultiplex_combinatorial,
-        interleaved=interleaved,
+        demultiplex_out=demultiplex_out,
+        demultiplex_out2=demultiplex_out2,
+        combinatorial_out=combinatorial_out,
+        combinatorial_out2=combinatorial_out2,
         force_fasta=args.fasta,
     )
 
 
-def determine_paired_mode(args):
+def open_combinatorial_out(adapter_names, adapter_names2, args, file_opener):
+    combinatorial_out = dict()
+    combinatorial_out2 = dict()
+    if args.discard_untrimmed:
+        extra = []
+    else:
+        extra = [(None, None)]
+        extra += [(None, name2) for name2 in adapter_names2]
+        extra += [(name1, None) for name1 in adapter_names]
+    for name1, name2 in list(itertools.product(adapter_names, adapter_names2)) + extra:
+        fname1 = name1 if name1 is not None else "unknown"
+        fname2 = name2 if name2 is not None else "unknown"
+        path1 = args.output.replace("{name1}", fname1).replace("{name2}", fname2)
+        path2 = args.paired_output.replace("{name1}", fname1).replace("{name2}", fname2)
+        combinatorial_out[(name1, name2)] = file_opener.xopen(path1, "wb")
+        combinatorial_out2[(name1, name2)] = file_opener.xopen(path2, "wb")
+    if args.untrimmed_output or args.untrimmed_paired_output:
+        raise CommandLineError(
+            "Combinatorial demultiplexing (with {name1} and {name2})"
+            " cannot be combined with --untrimmed-output or --untrimmed-paired-output")
+    untrimmed = untrimmed2 = None
+    return combinatorial_out, combinatorial_out2, untrimmed, untrimmed2
+
+
+def open_demultiplex_out(adapter_names, args, file_opener):
+    demultiplex_out = dict()
+    demultiplex_out2 = dict() if args.paired_output is not None else None
+    for name in adapter_names:
+        path1 = args.output.replace("{name}", name)
+        demultiplex_out[name] = file_opener.xopen(path1, "wb")
+        if args.paired_output is not None:
+            path2 = args.paired_output.replace("{name}", name)
+            demultiplex_out2[name] = file_opener.xopen(path2, "wb")
+    untrimmed_path = args.output.replace("{name}", "unknown")
+    if args.untrimmed_output:
+        untrimmed_path = args.untrimmed_output
+    if args.discard_untrimmed:
+        untrimmed = None
+    else:
+        untrimmed = file_opener.xopen(untrimmed_path, "wb")
+    if args.paired_output is not None:
+        untrimmed2_path = args.paired_output.replace("{name}", "unknown")
+        if args.untrimmed_paired_output:
+            untrimmed2_path = args.untrimmed_paired_output
+        if args.discard_untrimmed:
+            untrimmed2 = None
+        else:
+            untrimmed2 = file_opener.xopen(untrimmed2_path, "wb")
+    else:
+        untrimmed2 = None
+    return demultiplex_out, demultiplex_out2, untrimmed, untrimmed2
+
+
+def determine_demultiplex_mode(args) -> Union[str, bool]:
+    """Return one of "normal", "combinatorial" or False"""
+
+    demultiplex = args.output is not None and '{name}' in args.output
+
+    if args.paired_output is not None and (demultiplex != ('{name}' in args.paired_output)):
+        raise CommandLineError('When demultiplexing paired-end data, "{name}" must appear in '
+                               'both output file names (-o and -p)')
+
+    demultiplex_combinatorial = (
+        args.output is not None
+        and args.paired_output is not None
+        and '{name1}' in args.output
+        and '{name2}' in args.output
+        and '{name1}' in args.paired_output
+        and '{name2}' in args.paired_output
+    )
+    if demultiplex and demultiplex_combinatorial:
+        raise CommandLineError("You cannot combine {name} with {name1} and {name2}")
+
+    if demultiplex:
+        return "normal"
+    elif demultiplex_combinatorial:
+        return "combinatorial"
+    else:
+        return False
+
+
+def determine_paired(args) -> bool:
     """
     Determine whether we should work in paired-end mode.
     """
@@ -502,23 +560,14 @@ def determine_paired_mode(args):
         or args.adapters2
         or args.cut2
         or args.pair_filter
+        or args.untrimmed_paired_output
         or args.too_short_paired_output
         or args.too_long_paired_output)
 
 
-def determine_interleaved(args):
-    is_interleaved_input = False
-    is_interleaved_output = False
-    if args.interleaved:
-        is_interleaved_input = len(args.inputs) == 1
-        is_interleaved_output = not args.paired_output
-        if not is_interleaved_input and not is_interleaved_output:
-            raise CommandLineError("When --interleaved is used, you cannot provide both two "
-                "input files and two output files")
-    return is_interleaved_input, is_interleaved_output
-
-
-def input_files_from_parsed_args(inputs, paired, interleaved):
+def setup_input_files(
+    inputs: Sequence[str], paired: bool, interleaved: bool
+) -> Tuple[str, Optional[str]]:
     """
     Return tuple (input_filename, input_paired_filename)
     """
@@ -530,7 +579,7 @@ def input_files_from_parsed_args(inputs, paired, interleaved):
             "You provided {} input file names, but either one or two are expected. ".format(
                 len(inputs))
             + "The file names were:\n - "
-            + "\n - ".join("{!r}".format(p) for p in inputs)
+            + "\n - ".join("'{}'".format(p) for p in inputs)
             + "\nHint: If your path contains spaces, you need to enclose it in quotes")
     input_filename = inputs[0]
     if paired and not interleaved:
@@ -541,7 +590,7 @@ def input_files_from_parsed_args(inputs, paired, interleaved):
                 "but then you also need to provide two input files (you provided one) or "
                 "use --interleaved.")
         else:
-            input_paired_filename = inputs[1]
+            input_paired_filename = inputs[1]  # type: Optional[str]
     else:
         if len(inputs) == 2:
             raise CommandLineError(
@@ -553,7 +602,7 @@ def input_files_from_parsed_args(inputs, paired, interleaved):
     return input_filename, input_paired_filename
 
 
-def check_arguments(args, paired, is_interleaved_output):
+def check_arguments(args, paired: bool) -> None:
     if not paired:
         if args.untrimmed_paired_output:
             raise CommandLineError("Option --untrimmed-paired-output can only be used when "
@@ -563,31 +612,24 @@ def check_arguments(args, paired, is_interleaved_output):
             raise CommandLineError("Option --pair-adapters can only be used when trimming "
                 "paired-end reads")
 
-    if paired:
-        if not is_interleaved_output:
-            if not args.paired_output:
-                raise CommandLineError("When a paired-end trimming option such as -A/-G/-B/-U, "
-                    "is used, a second output file needs to be specified via -p (--paired-output).")
-            if not args.output:
-                raise CommandLineError("When you use -p or --paired-output, you must also "
-                    "use the -o option.")
+    if paired and not args.interleaved:
+        if not args.paired_output:
+            raise CommandLineError("When a paired-end trimming option such as -A/-G/-B/-U, "
+                "is used, a second output file needs to be specified via -p (--paired-output).")
+        if not args.output:
+            raise CommandLineError("When you use -p or --paired-output, you must also "
+                "use the -o option.")
+        for out, paired_out, argname in [
+            (args.untrimmed_output, args.untrimmed_paired_output, "untrimmed"),
+            (args.too_short_output, args.too_short_paired_output, "too-short"),
+            (args.too_long_output, args.too_long_paired_output, "too-long"),
+        ]:
+            if bool(out) != bool(paired_out):
+                raise CommandLineError(
+                    "When trimming paired-end data, you must use either none or both of the"
+                    " --{name}-output/--{name}-paired-output options.".format(name=argname)
+                )
 
-        if bool(args.untrimmed_output) != bool(args.untrimmed_paired_output):
-            raise CommandLineError("When trimming paired-end reads, you must use either none "
-                "or both of the --untrimmed-output/--untrimmed-paired-output options.")
-        if args.too_short_output and not args.too_short_paired_output:
-            raise CommandLineError("When using --too-short-output with paired-end "
-                "reads, you also need to use --too-short-paired-output")
-        if args.too_long_output and not args.too_long_paired_output:
-            raise CommandLineError("When using --too-long-output with paired-end "
-                "reads, you also need to use --too-long-paired-output")
-
-    if args.format is not None:
-        logger.warning("Option --format is deprecated and ignored because the input file format is "
-            "always auto-detected")
-
-    if not (0 <= args.error_rate < 1.):
-        raise CommandLineError("The maximum error rate must be at least 0 and less than 1.")
     if args.overlap < 1:
         raise CommandLineError("The overlap must be at least 1.")
     if not (0 <= args.gc_content <= 100):
@@ -597,7 +639,7 @@ def check_arguments(args, paired, is_interleaved_output):
         raise CommandLineError("--pair-adapters cannot be used with --times")
 
 
-def pipeline_from_parsed_args(args, paired, is_interleaved_output, file_opener):
+def pipeline_from_parsed_args(args, paired, file_opener, adapters, adapters2) -> Pipeline:
     """
     Setup a processing pipeline from parsed command-line arguments.
 
@@ -605,38 +647,21 @@ def pipeline_from_parsed_args(args, paired, is_interleaved_output, file_opener):
 
     Return an instance of Pipeline (SingleEndPipeline or PairedEndPipeline)
     """
-    check_arguments(args, paired, is_interleaved_output)
     if args.action == 'none':
         args.action = None
-
-    adapter_parser = AdapterParser(
-        max_error_rate=args.error_rate,
-        min_overlap=args.overlap,
-        read_wildcards=args.match_read_wildcards,
-        adapter_wildcards=args.match_adapter_wildcards,
-        indels=args.indels,
-    )
-    try:
-        adapters = adapter_parser.parse_multi(args.adapters)
-        adapters2 = adapter_parser.parse_multi(args.adapters2)
-    except (FileNotFoundError, ValueError) as e:
-        raise CommandLineError(e)
-    warn_duplicate_adapters(adapters)
-    warn_duplicate_adapters(adapters2)
-    if args.debug:
-        for adapter in adapters + adapters2:
-            adapter.enable_debug()
 
     # Create the processing pipeline
     if paired:
         pair_filter_mode = 'any' if args.pair_filter is None else args.pair_filter
-        pipeline = PairedEndPipeline(pair_filter_mode, file_opener)
+        pipeline = PairedEndPipeline(
+            pair_filter_mode, file_opener
+        )  # type: Any
     else:
         pipeline = SingleEndPipeline(file_opener)
 
     # When adapters are being trimmed only in R1 or R2, override the pair filter mode
     # as using the default of 'any' would regard all read pairs as untrimmed.
-    if paired and (not adapters2 or not adapters) and (
+    if isinstance(pipeline, PairedEndPipeline) and (not adapters2 or not adapters) and (
             args.discard_untrimmed or args.untrimmed_output or args.untrimmed_paired_output):
         pipeline.override_untrimmed_pair_filter = True
 
@@ -650,24 +675,17 @@ def pipeline_from_parsed_args(args, paired, is_interleaved_output, file_opener):
         cutoffs = parse_cutoffs(args.quality_cutoff)
         pipeline_add(QualityTrimmer(cutoffs[0], cutoffs[1], args.quality_base))
 
-    if args.pair_adapters:
-        try:
-            cutter = PairedAdapterCutter(adapters, adapters2, args.action)
-        except PairedAdapterCutterError as e:
-            raise CommandLineError("--pair-adapters: " + str(e))
-        pipeline.add_paired_modifier(cutter)
-    else:
-        adapter_cutter, adapter_cutter2 = None, None
-        if adapters:
-            adapter_cutter = AdapterCutter(adapters, args.times, args.action)
-        if adapters2:
-            adapter_cutter2 = AdapterCutter(adapters2, args.times, args.action)
-        if paired:
-            if adapter_cutter or adapter_cutter2:
-                pipeline.add(adapter_cutter, adapter_cutter2)
-        else:
-            if adapter_cutter:
-                pipeline.add(adapter_cutter)
+    add_adapter_cutter(
+        pipeline,
+        adapters,
+        adapters2,
+        paired,
+        args.pair_adapters,
+        args.action,
+        args.times,
+        args.reverse_complement,
+        args.index,
+    )
 
     for modifier in modifiers_applying_to_both_ends_if_paired(args):
         pipeline_add(modifier)
@@ -684,6 +702,7 @@ def pipeline_from_parsed_args(args, paired, is_interleaved_output, file_opener):
                 lengths = (lengths[0], lengths[0])
             setattr(pipeline, attr, lengths)
     pipeline.max_n = args.max_n
+    pipeline.max_expected_errors = args.max_expected_errors
     pipeline.discard_casava = args.discard_casava
     pipeline.discard_trimmed = args.discard_trimmed
     pipeline.discard_untrimmed = args.discard_untrimmed
@@ -691,7 +710,28 @@ def pipeline_from_parsed_args(args, paired, is_interleaved_output, file_opener):
     return pipeline
 
 
-def add_unconditional_cutters(pipeline, cut1, cut2, paired):
+def adapters_from_args(args) -> Tuple[List[Adapter], List[Adapter]]:
+    adapter_parser = AdapterParser(
+        max_errors=args.error_rate,
+        min_overlap=args.overlap,
+        read_wildcards=args.match_read_wildcards,
+        adapter_wildcards=args.match_adapter_wildcards,
+        indels=args.indels,
+    )
+    try:
+        adapters = adapter_parser.parse_multi(args.adapters)
+        adapters2 = adapter_parser.parse_multi(args.adapters2)
+    except (FileNotFoundError, ValueError, InvalidCharacter) as e:
+        raise CommandLineError(e)
+    warn_duplicate_adapters(adapters)
+    warn_duplicate_adapters(adapters2)
+    if args.debug > 1:
+        for adapter in adapters + adapters2:
+            adapter.enable_debug()
+    return adapters, adapters2
+
+
+def add_unconditional_cutters(pipeline: Pipeline, cut1: List[int], cut2: List[int], paired: bool):
     for i, cut_arg in enumerate([cut1, cut2]):
         # cut_arg is a list
         if not cut_arg:
@@ -705,8 +745,10 @@ def add_unconditional_cutters(pipeline, cut1, cut2, paired):
                 continue
             if i == 0:  # R1
                 if paired:
+                    assert isinstance(pipeline, PairedEndPipeline)
                     pipeline.add(UnconditionalCutter(c), None)
                 else:
+                    assert isinstance(pipeline, SingleEndPipeline)
                     pipeline.add(UnconditionalCutter(c))
             else:
                 # R2
@@ -714,7 +756,50 @@ def add_unconditional_cutters(pipeline, cut1, cut2, paired):
                 pipeline.add(None, UnconditionalCutter(c))
 
 
-def modifiers_applying_to_both_ends_if_paired(args):
+def add_adapter_cutter(
+    pipeline,
+    adapters,
+    adapters2,
+    paired: bool,
+    pair_adapters: bool,
+    action: Optional[str],
+    times: int,
+    reverse_complement: bool,
+    allow_index: bool,
+):
+    if pair_adapters:
+        if reverse_complement:
+            raise CommandLineError("Cannot use --revcomp with --pair-adapters")
+        try:
+            cutter = PairedAdapterCutter(adapters, adapters2, action)
+        except PairedAdapterCutterError as e:
+            raise CommandLineError("--pair-adapters: " + str(e))
+        pipeline.add_paired_modifier(cutter)
+    else:
+        adapter_cutter, adapter_cutter2 = None, None
+        try:
+            if adapters:
+                adapter_cutter = AdapterCutter(adapters, times, action, allow_index)
+            if adapters2:
+                adapter_cutter2 = AdapterCutter(adapters2, times, action, allow_index)
+        except ValueError as e:
+            raise CommandLineError(e)
+        if paired:
+            if reverse_complement:
+                raise CommandLineError("--revcomp not implemented for paired-end reads")
+            if adapter_cutter or adapter_cutter2:
+                pipeline.add(adapter_cutter, adapter_cutter2)
+        elif adapter_cutter:
+            if reverse_complement:
+                modifier = ReverseComplementer(
+                    adapter_cutter
+                )  # type: Union[AdapterCutter,ReverseComplementer]
+            else:
+                modifier = adapter_cutter
+            pipeline.add(modifier)
+
+
+def modifiers_applying_to_both_ends_if_paired(args) -> Iterator[SingleEndModifier]:
     if args.length is not None:
         yield Shortener(args.length)
     if args.trim_n:
@@ -739,97 +824,83 @@ def log_header(cmdlineargs):
     logger.info("Command line parameters: %s", " ".join(cmdlineargs))
 
 
-def main(cmdlineargs=None, default_outfile=sys.stdout.buffer):
+def main_cli():  # pragma: no cover
+    """Entry point for command-line script"""
+    main(sys.argv[1:])
+    return 0
+
+
+def main(cmdlineargs, default_outfile=sys.stdout.buffer) -> Statistics:
     """
-    Main function that sets up a processing pipeline and runs it.
+    Set up a processing pipeline from the command-line arguments, run it and return
+    a Statistics object.
 
     default_outfile is the file to which trimmed reads are sent if the ``-o``
     parameter is not used.
     """
     start_time = time.time()
     parser = get_argument_parser()
-    if cmdlineargs is None:
-        cmdlineargs = sys.argv[1:]
-    args = parser.parse_args(args=cmdlineargs)
-    # log to stderr if results are to be sent to stdout
-    log_to_stdout = args.output is not None and args.output != "-" and args.paired_output != "-"
+    args, leftover_args = parser.parse_known_args(args=cmdlineargs)
     # Setup logging only if there are not already any handlers (can happen when
     # this function is being called externally such as from unit tests)
     if not logging.root.handlers:
+        # If results are to be sent to stdout, logging needs to go to stderr
+        log_to_stdout = args.output is not None and args.output != "-" and args.paired_output != "-"
         setup_logging(logger, stdout=log_to_stdout,
             quiet=args.quiet, minimal=args.report == 'minimal', debug=args.debug)
-    if args.profile:
-        import cProfile
-        profiler = cProfile.Profile()
-        profiler.enable()
+    log_header(cmdlineargs)
+    profiler = setup_profiler_if_requested(args.profile)
 
     if args.quiet and args.report:
         parser.error("Options --quiet and --report cannot be used at the same time")
 
-    if args.colorspace:
-        parser.error(
-            "These colorspace-specific options are no longer supported: "
-            "--colorspace, -c, -d, --double-encode, -t, --trim-primer, "
-            "--strip-f3, --maq, --bwa, --no-zero-cap. "
-            "Use Cutadapt 1.18 or earlier to work with colorspace data.")
+    if leftover_args:
+        warn_if_en_dashes(cmdlineargs)
+        parser.error("unrecognized arguments: " + " ".join(leftover_args))
 
-    paired = determine_paired_mode(args)
-    assert paired in (False, True)
-
-    # Print the header now because some of the functions below create logging output
-    log_header(cmdlineargs)
     if args.cores < 0:
         parser.error('Value for --cores cannot be negative')
 
     cores = available_cpu_count() if args.cores == 0 else args.cores
     file_opener = FileOpener(
         compression_level=args.compression_level, threads=0 if cores == 1 else None)
-    try:
-        is_interleaved_input, is_interleaved_output = determine_interleaved(args)
-        input_filename, input_paired_filename = input_files_from_parsed_args(args.inputs,
-            paired, is_interleaved_input)
-        pipeline = pipeline_from_parsed_args(args, paired, is_interleaved_output, file_opener)
-        outfiles = open_output_files(args, default_outfile, is_interleaved_output, file_opener)
-    except CommandLineError as e:
-        parser.error(str(e))
-        return  # avoid IDE warnings below
-
-    if cores > 1:
-        if ParallelPipelineRunner.can_output_to(outfiles):
-            runner_class = ParallelPipelineRunner
-            runner_kwargs = dict(n_workers=cores, buffer_size=args.buffer_size)
-        else:
-            parser.error("Running in parallel is currently not supported "
-                "when using --format or when demultiplexing.\n"
-                "Omit --cores/-j to continue.")
-            return  # avoid IDE warnings below
-    else:
-        runner_class = SerialPipelineRunner
-        runner_kwargs = dict()
-    infiles = InputFiles(input_filename, file2=input_paired_filename,
-            interleaved=is_interleaved_input)
     if sys.stderr.isatty() and not args.quiet:
         progress = Progress()
     else:
         progress = DummyProgress()
+    paired = determine_paired(args)
+    assert paired in (False, True)
+
     try:
-        runner = runner_class(pipeline, infiles, outfiles, progress, **runner_kwargs)
-    except (dnaio.UnknownFileFormat, IOError) as e:
-        parser.error(e)
-        return  # avoid IDE warnings below
+        is_interleaved_input = args.interleaved and len(args.inputs) == 1
+        input_filename, input_paired_filename = setup_input_files(args.inputs,
+            paired, is_interleaved_input)
+        check_arguments(args, paired)
+        adapters, adapters2 = adapters_from_args(args)
+        pipeline = pipeline_from_parsed_args(args, paired, file_opener, adapters, adapters2)
+        adapter_names = [a.name for a in adapters]  # type: List[str]
+        adapter_names2 = [a.name for a in adapters2]  # type: List[str]
+        outfiles = open_output_files(args, default_outfile, file_opener, adapter_names, adapter_names2)
+        inpaths = InputPaths(input_filename, path2=input_paired_filename, interleaved=is_interleaved_input)
+        runner = setup_runner(pipeline, inpaths, outfiles, progress, cores, args.buffer_size, file_opener)
+    except CommandLineError as e:
+        logger.debug("Command line error. Traceback:", exc_info=True)
+        parser.error(str(e))
+        return
 
     logger.info("Processing reads on %d core%s in %s mode ...",
         cores, 's' if cores > 1 else '',
         {False: 'single-end', True: 'paired-end'}[pipeline.paired])
     try:
-        stats = runner.run()
-        runner.close()
+        with runner as r:
+            stats = r.run()
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
         sys.exit(130)
     except BrokenPipeError:
         sys.exit(1)
     except (dnaio.FileFormatError, dnaio.UnknownFileFormat, EOFError) as e:
+        logger.debug("Command line error. Traceback:", exc_info=True)
         sys.exit("cutadapt: error: {}".format(e))
 
     elapsed = time.time() - start_time
@@ -838,11 +909,52 @@ def main(cmdlineargs=None, default_outfile=sys.stdout.buffer):
     else:
         report = full_report
     logger.log(REPORT, '%s', report(stats, elapsed, args.gc_content / 100))
-    if args.profile:
+    if profiler is not None:
         import pstats
         profiler.disable()
         pstats.Stats(profiler).sort_stats('time').print_stats(20)
+    return stats
 
 
-if __name__ == '__main__':
-    main()
+def setup_runner(
+    pipeline: Pipeline,
+    inpaths: InputPaths,
+    outfiles: OutputFiles,
+    progress: Progress,
+    cores: int,
+    buffer_size: int,
+    file_opener: FileOpener,
+) -> PipelineRunner:
+    try:
+        if cores > 1:
+            return ParallelPipelineRunner(
+                pipeline, inpaths, outfiles, progress, n_workers=cores, buffer_size=buffer_size)
+        else:
+            infiles = inpaths.open(file_opener)
+            return SerialPipelineRunner(pipeline, infiles, outfiles, progress)
+    except (dnaio.UnknownFileFormat, dnaio.FileFormatError, OSError) as e:
+        raise CommandLineError(e)
+
+
+def setup_profiler_if_requested(requested):
+    if requested:
+        import cProfile
+        profiler = cProfile.Profile()
+        profiler.enable()
+    else:
+        profiler = None
+    return profiler
+
+
+def warn_if_en_dashes(args):
+    for arg in args:
+        if arg.startswith("–"):
+            logger.warning(
+                "The first character in argument '%s' is '–' (an en-dash, Unicode U+2013)"
+                " and will therefore be interpreted as a file name. If you wanted to"
+                " provide an option, use a regular hyphen '-'.", arg
+            )
+
+
+if __name__ == '__main__':  # pragma: no cover
+    sys.exit(main_cli())

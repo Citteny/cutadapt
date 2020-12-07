@@ -2,6 +2,95 @@
 Changes
 =======
 
+v3.1 (2020-12-03)
+-----------------
+
+* :issue:`443`: With ``--action=retain``, it is now possible to trim reads while
+  leaving the adapter sequence itself in the read. That is, only the sequence
+  before (for 5’ adapters) or after (for 3’ adapters) is removed. With linked
+  adapters, both adapters are retained.
+* :issue:`495`: Running with multiple cores did not work using macOS and Python 3.8+.
+  To prevent problems like these in the future, automated testing has been extended
+  to also run on macOS.
+* :issue:`482`: Print statistics for ``--discard-casava`` and ``--max-ee`` in the
+  report.
+* :issue:`497`: The changelog for 3.0 previously forgot to mention that the following
+  options, which were deprecated in version 2.0, have now been removed, and
+  using them will lead to an error: ``--format``, ``--colorspace``, ``-c``, ``-d``,
+  ``--double-encode``, ``-t``, ``--trim-primer``, ``--strip-f3``, ``--maq``,
+  ``--bwa``, ``--no-zero-cap``. This frees up some single-character options,
+  allowing them to be re-purposed for future Cutadapt features.
+
+v3.0 (2020-11-10)
+-----------------
+
+* Demultiplexing on multiple cores is now supported. This was the last feature that
+  only ran single-threaded.
+* :issue:`478`: Demultiplexing now always generates all possible output files.
+* :issue:`358`: You can now use ``-e`` also :ref:`to specify the maximum number of
+  errors <error-tolerance>` (instead of the maximum error rate). For example, write
+  ``-e 2`` to allow two errors over a full-length adapter match.
+* :pr:`486`: Trimming many anchored adapters (for example when demultiplexing)
+  is now faster by using an index even when indels are allowed. Previously, Cutadapt
+  would only be able to build an index with ``--no-indels``.
+* :issue:`469`: Cutadapt did not run under Python 3.8 on recent macOS versions.
+* :issue:`425`: Change the default compression level for ``.gz`` output files from 6
+  to 5. This reduces the time used for compression by about 50% while increasing file
+  size by less than 10%. To get the old behavior, use ``--compression-level=6``.
+  If you use Cutadapt to create intermediate files that are deleted anyway,
+  consider also using the even faster option ``-Z`` (same as ``--compression-level=1``).
+* :pr:`485`: Fix that, under some circumstances, in particular when trimming a
+  5' adapter and there was a mismatch in its last nucleotide(s), not the entire adapter
+  sequence would be trimmed from the read. Since fixing this required changed the
+  alignment algorithm slightly, this is a backwards incompatible change.
+* Fix that the report did not include the number of reads that are too long, too short
+  or had too many ``N``. (This unintentionally disappeared in a previous version.)
+* :issue:`487`: When demultiplexing, the reported number of written pairs was
+  always zero.
+* :issue:`497`: The following options, which were deprecated in version 2.0, have
+  been removed, and using them will lead to an error:
+  ``--format``, ``--colorspace``, ``-c``, ``-d``, ``--double-encode``,
+  ``-t``, ``--trim-primer``, ``--strip-f3``, ``--maq``, ``--bwa``, ``--no-zero-cap``.
+  This frees up some single-character options,
+  allowing them to be re-purposed for future Cutadapt features.
+* Ensure Cutadapt runs under Python 3.9.
+* Drop support for Python 3.5.
+
+v2.10 (2020-04-22)
+------------------
+
+* Fixed a performance regression introduced in version 2.9.
+* :pr:`449`: ``--action=`` could not be used with ``--pair-adapters``.
+  Fix contributed by wlokhorst.
+* :issue:`450`: ``--untrimmed-output``, ``--too-short-output`` and ``--too-long-output`` can
+  now be written interleaved.
+* :issue:`453`: Fix problem that ``N`` wildcards in adapters did not match ``N`` characters
+  in the read. ``N`` characters now match any character in the read, independent of whether
+  ``--match-read-wildcards`` is used or not.
+* With ``--action=lowercase``/``mask``, print which sequences would have been
+  removed in the “Overview of removed sequences” statistics. Previously, it
+  would show that no sequences have been removed.
+
+v2.9 (2020-03-18)
+-----------------
+
+* :issue:`441`: Add a ``--max-ee`` (or ``--max-expected-errors``) option
+  for filtering reads whose number of expected errors exceeds the given
+  threshold. The idea comes from
+  `Edgar et al. (2015) <https://academic.oup.com/bioinformatics/article/31/21/3476/194979>`_.
+* :issue:`438`: The info file now contains the `` rc`` suffix that is added to
+  the names of reverse-complemented reads (with ``--revcomp``).
+* :issue:`448`: ``.bz2`` and ``.xz`` output wasn’t possible in multi-core mode.
+
+v2.8 (2020-01-13)
+-----------------
+
+* :issue:`220`: With option ``--revcomp``, Cutadapt now searches both the read
+  and its reverse complement for adapters. The version that matches best is
+  kept. This can be used to “normalize” strandedness.
+* :issue:`430`: ``--action=lowercase`` now works with linked adapters
+* :issue:`431`: Info files can now be written even for linked adapters.
+
 v2.7 (2019-11-22)
 -----------------
 

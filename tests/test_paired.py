@@ -5,7 +5,7 @@ from itertools import product
 import pytest
 
 from cutadapt.__main__ import main
-from utils import assert_files_equal, datapath, cutpath, redirect_stderr
+from utils import assert_files_equal, datapath, cutpath
 
 
 @pytest.fixture
@@ -18,9 +18,10 @@ def run_paired(tmpdir):
         path2 = str(tmpdir.join(expected2))
         params += ["-o", path1, "-p", path2]
         params += [datapath(in1), datapath(in2)]
-        assert main(params) is None
+        stats = main(params)
         assert_files_equal(cutpath(expected1), path1)
         assert_files_equal(cutpath(expected2), path2)
+        return stats
 
     return _run
 
@@ -45,11 +46,12 @@ def run_interleaved(tmpdir):
         if expected2:
             tmp2 = str(tmpdir.join("out2-" + expected2))
             params += ["-p", tmp2]
-            assert main(params + paths) is None
+            stats = main(params + paths)
             assert_files_equal(cutpath(expected2), tmp2)
         else:
-            assert main(params + paths) is None
+            stats = main(params + paths)
         assert_files_equal(cutpath(expected1), tmp1)
+        return stats
 
     return _run
 
@@ -102,13 +104,13 @@ def test_untrimmed_paired_output_automatic_pair_filter(tmpdir, run_paired):
 
 
 def test_explicit_format_with_paired(tmpdir, run_paired):
-    # Use --format=fastq with input files whose extension is .txt
+    # Use FASTQ input files whose extension is .txt
     txt1 = str(tmpdir.join("paired.1.txt"))
     txt2 = str(tmpdir.join("paired.2.txt"))
     shutil.copyfile(datapath("paired.1.fastq"), txt1)
     shutil.copyfile(datapath("paired.2.fastq"), txt2)
     run_paired(
-        "--format=fastq -a TTAGACATAT -m 14 -q 10",
+        "-a TTAGACATAT -m 14 -q 10",
         in1=txt1, in2=txt2,
         expected1="paired.m14.1.fastq",
         expected2="paired.m14.2.fastq",
@@ -131,9 +133,8 @@ def test_no_trimming():
 
 
 def test_missing_file(tmpdir):
-    with redirect_stderr():
-        with pytest.raises(SystemExit):
-            main(["--paired-output", str(tmpdir.join("out.fastq")), datapath("paired.1.fastq")])
+    with pytest.raises(SystemExit):
+        main(["--paired-output", str(tmpdir.join("out.fastq")), datapath("paired.1.fastq")])
 
 
 def test_first_too_short(tmpdir, cores):
@@ -144,14 +145,13 @@ def test_first_too_short(tmpdir, cores):
         lines = lines[:-4]
     trunc1.write("".join(lines))
 
-    with redirect_stderr():
-        with pytest.raises(SystemExit):
-            main([
-                "-o", "/dev/null",
-                "--paired-output", str(tmpdir.join("out.fastq")),
-                "--cores", str(cores),
-                str(trunc1), datapath("paired.2.fastq")
-            ])
+    with pytest.raises(SystemExit):
+        main([
+            "-o", "/dev/null",
+            "--paired-output", str(tmpdir.join("out.fastq")),
+            "--cores", str(cores),
+            str(trunc1), datapath("paired.2.fastq")
+        ])
 
 
 def test_second_too_short(tmpdir, cores):
@@ -162,14 +162,13 @@ def test_second_too_short(tmpdir, cores):
         lines = lines[:-4]
     trunc2.write("".join(lines))
 
-    with redirect_stderr():
-        with pytest.raises(SystemExit):
-            main([
-                "-o", "/dev/null",
-                "--paired-output", str(tmpdir.join("out.fastq")),
-                "--cores", str(cores),
-                datapath("paired.1.fastq"), str(trunc2)
-            ])
+    with pytest.raises(SystemExit):
+        main([
+            "-o", "/dev/null",
+            "--paired-output", str(tmpdir.join("out.fastq")),
+            "--cores", str(cores),
+            datapath("paired.1.fastq"), str(trunc2)
+        ])
 
 
 def test_unmatched_read_names(tmpdir, cores):
@@ -327,10 +326,24 @@ def test_interleaved_neither_nor(tmpdir):
     p1 = str(tmpdir.join("temp-paired.1.fastq"))
     p2 = str(tmpdir.join("temp-paired.2.fastq"))
     params = "-a XX --interleaved".split()
-    with redirect_stderr():
-        params += ["-o", p1, "-p1", p2, "paired.1.fastq", "paired.2.fastq"]
-        with pytest.raises(SystemExit):
-            main(params)
+    params += ["-o", p1, "-p1", p2, "paired.1.fastq", "paired.2.fastq"]
+    with pytest.raises(SystemExit):
+        main(params)
+
+
+def test_interleaved_untrimmed_output(tmpdir):
+    o1 = str(tmpdir.join("out.1.fastq"))
+    o2 = str(tmpdir.join("out.2.fastq"))
+    untrimmed = str(tmpdir.join("untrimmed.interleaved.fastq"))
+    main([
+        "--interleaved",
+        "-a", "XXXX",
+        "-o", o1,
+        "-p", o2,
+        "--untrimmed-output", untrimmed,
+        datapath("interleaved.fastq")
+    ])
+    assert_files_equal(datapath("interleaved.fastq"), untrimmed)
 
 
 def test_pair_filter_both(run_paired, cores):
@@ -399,15 +412,16 @@ def test_nextseq_paired(run_paired, cores):
         cores=cores)
 
 
-def test_paired_demultiplex(tmpdir):
+def test_paired_demultiplex(tmpdir, cores):
     multiout1 = str(tmpdir.join("demultiplexed.{name}.1.fastq"))
     multiout2 = str(tmpdir.join("demultiplexed.{name}.2.fastq"))
     params = [
+        "--cores", str(cores),
         "-a", "first=AACATTAGACA", "-a", "second=CATTAGACATATCGG",
         "-A", "ignored=CAGTGGAGTA", "-A", "alsoignored=AATAACAGTGGAGTA",
         "-o", multiout1, "-p", multiout2,
         datapath("paired.1.fastq"), datapath("paired.2.fastq")]
-    assert main(params) is None
+    main(params)
     assert_files_equal(cutpath("demultiplexed.first.1.fastq"), multiout1.format(name="first"))
     assert_files_equal(cutpath("demultiplexed.second.1.fastq"), multiout1.format(name="second"))
     assert_files_equal(cutpath("demultiplexed.unknown.1.fastq"), multiout1.format(name="unknown"))
@@ -491,7 +505,7 @@ def test_pair_adapters_demultiplexing(tmpdir):
     params += ["-o", str(tmpdir.join("dual-{name}.1.fastq"))]
     params += ["-p", str(tmpdir.join("dual-{name}.2.fastq"))]
     params += [datapath("dual-index.1.fastq"), datapath("dual-index.2.fastq")]
-    assert main(params) is None
+    main(params)
     for name in [
         "dual-i1.1.fastq",
         "dual-i1.2.fastq",
@@ -504,25 +518,33 @@ def test_pair_adapters_demultiplexing(tmpdir):
         assert_files_equal(cutpath(name), str(tmpdir.join(name)))
 
 
-def test_combinatorial_demultiplexing(tmpdir):
+@pytest.mark.parametrize("discarduntrimmed", (False, True))
+def test_combinatorial_demultiplexing(tmpdir, discarduntrimmed):
     params = "-g A=^AAAAAAAAAA -g C=^CCCCCCCCCC -G G=^GGGGGGGGGG -G T=^TTTTTTTTTT".split()
     params += ["-o", str(tmpdir.join("combinatorial.{name1}_{name2}.1.fasta"))]
     params += ["-p", str(tmpdir.join("combinatorial.{name1}_{name2}.2.fasta"))]
     params += [datapath("combinatorial.1.fasta"), datapath("combinatorial.2.fasta")]
-    assert main(params) is None
-    for (name1, name2) in [
-        ("A", "G"),
-        ("A", "T"),
-        ("C", "G"),
-        ("C", "T"),
-        ("unknown", "G"),
-        ("A", "unknown"),
-    ]:
+    # third item in tuple says whether the file must exist
+    combinations = [(a, b, True) for a, b in product("AC", "GT")]
+    optional = [("unknown", "unknown")]
+    optional += [(a, "unknown") for a in "AC"]
+    optional += [("unknown", b) for b in "GT"]
+    if discarduntrimmed:
+        combinations.extend((a, b, False) for a, b in optional)
+        params += ["--discard-untrimmed"]
+    else:
+        combinations.extend((a, b, True) for a, b in optional)
+    main(params)
+    for (name1, name2, should_exist) in combinations:
         for i in (1, 2):
             name = "combinatorial.{name1}_{name2}.{i}.fasta".format(name1=name1, name2=name2, i=i)
             path = cutpath(os.path.join("combinatorial", name))
-            assert tmpdir.join(name).check(), "Output file missing"
-            assert_files_equal(path, str(tmpdir.join(name)))
+            if should_exist:
+                assert tmpdir.join(name).check(), ("Output file missing", name)
+                if os.path.exists(path):
+                    assert_files_equal(path, str(tmpdir.join(name)))
+            else:
+                assert not tmpdir.join(name).check(), ("Output file should not exist", name)
 
 
 def test_info_file(tmpdir):
@@ -534,4 +556,4 @@ def test_info_file(tmpdir):
         datapath("paired.1.fastq"),
         datapath("paired.2.fastq"),
     ]
-    assert main(params) is None
+    main(params)

@@ -1,10 +1,12 @@
 # cython: profile=False, emit_code_comments=False, language_level=3
 from cpython.mem cimport PyMem_Malloc, PyMem_Free, PyMem_Realloc
 
+DEF MATCH_SCORE = 16384
+
 # structure for a DP matrix entry
 ctypedef struct _Entry:
     int cost
-    int matches  # no. of matches in this alignment
+    int score    # score for this alignment (mostly keeps track of matches)
     int origin   # where the alignment originated: negative for positions within seq1, positive for pos. within seq2
 
 
@@ -12,6 +14,7 @@ ctypedef struct _Match:
     int origin
     int cost
     int matches
+    int score
     int ref_stop
     int query_stop
 
@@ -20,12 +23,12 @@ def _acgt_table():
     """
     Return a translation table that maps A, C, G, T characters to the lower
     four bits of a byte. Other characters (including possibly IUPAC characters)
-    are mapped to zero.
+    are mapped to the most significant bit (0x80).
 
     Lowercase versions are also translated, and U is treated the same as T.
     """
     d = dict(A=1, C=2, G=4, T=8, U=8)
-    t = bytearray(b'\0') * 256
+    t = bytearray([0x80]) * 256
     for c, v in d.items():
         t[ord(c)] = v
         t[ord(c.lower())] = v
@@ -39,7 +42,11 @@ def _iupac_table():
     The table maps ASCII-encoded IUPAC nucleotide characters to bytes in which
     the four least significant bits are used to represent one nucleotide each.
 
-    Whether two characters x and y match can then be checked with the
+    For the "N" wildcard, additionally the most significant bit is set (0x80),
+    which allows it to match characters that are not A, C, G or T if _acgt_table
+    was used to encode them.
+
+    Whether two encoded characters x and y match can then be checked with the
     expression "x & y != 0".
     """
     A = 1
@@ -63,7 +70,7 @@ def _iupac_table():
         D=A|G|T,
         H=A|C|T,
         V=A|C|G,
-        N=A|C|G|T
+        N=A|C|G|T + 0x80,
     )
     t = bytearray(b'\0') * 256
     for c, v in iupac.items():
@@ -72,8 +79,9 @@ def _iupac_table():
     return bytes(t)
 
 
-cdef bytes ACGT_TABLE = _acgt_table()
-cdef bytes IUPAC_TABLE = _iupac_table()
+cdef:
+    bytes ACGT_TABLE = _acgt_table()
+    bytes IUPAC_TABLE = _iupac_table()
 
 
 class DPMatrix:
@@ -108,6 +116,10 @@ class DPMatrix:
             r = c + ' ' + ' '.join('  ' if v is None else '{:2d}'.format(v) for v in row)
             rows.append(r)
         return '\n'.join(rows)
+
+
+cdef int score_to_matches(int score) nogil:
+    return (score + MATCH_SCORE - 1) // MATCH_SCORE
 
 
 cdef class Aligner:
@@ -232,6 +244,29 @@ cdef class Aligner:
         self._insertion_cost = indel_cost
         self._deletion_cost = indel_cost
 
+    def _compute_flags(self):
+        cdef int flags = 0
+        if self.start_in_reference:
+            flags |= 1
+        if self.start_in_query:
+            flags |= 2
+        if self.stop_in_reference:
+            flags |= 4
+        if self.stop_in_query:
+            flags |= 8
+        return flags
+
+    def __reduce__(self):
+        return (Aligner, (self.reference, self.max_error_rate, self._compute_flags(), self.wildcard_ref, self.wildcard_query, self._insertion_cost, self._min_overlap))
+
+    def __repr__(self):
+        return (
+            f"Aligner(reference='{self.reference}, max_error_rate={self.max_error_rate}, "
+            f"flags={self._compute_flags()}, wildcard_ref={self.wildcard_ref}, "
+            f"wildcard_query={self.wildcard_query}, indel_cost={self._insertion_cost}, "
+            f"min_overlap={self._min_overlap})"
+        )
+
     def _set_reference(self, str reference):
         mem = <_Entry*> PyMem_Realloc(self.column, (len(reference) + 1) * sizeof(_Entry))
         if not mem:
@@ -346,22 +381,22 @@ cdef class Aligner:
         # fill out columns only until 'last'
         if not self.start_in_reference and not self.start_in_query:
             for i in range(m + 1):
-                column[i].matches = 0
+                column[i].score = 0
                 column[i].cost = max(i, min_n) * self._insertion_cost
                 column[i].origin = 0
         elif self.start_in_reference and not self.start_in_query:
             for i in range(m + 1):
-                column[i].matches = 0
+                column[i].score = 0
                 column[i].cost = min_n * self._insertion_cost
                 column[i].origin = min(0, min_n - i)
         elif not self.start_in_reference and self.start_in_query:
             for i in range(m + 1):
-                column[i].matches = 0
+                column[i].score = 0
                 column[i].cost = i * self._insertion_cost
                 column[i].origin = max(0, min_n - i)
         else:
             for i in range(m + 1):
-                column[i].matches = 0
+                column[i].score = 0
                 column[i].cost = min(i, min_n) * self._insertion_cost
                 column[i].origin = min_n - i
 
@@ -374,6 +409,7 @@ cdef class Aligner:
         best.query_stop = n
         best.cost = m + n
         best.origin = 0
+        best.score = 0
         best.matches = 0
 
         # Ukkonen's trick: index of the last cell that is at most k
@@ -385,11 +421,12 @@ cdef class Aligner:
             int cost_diag
             int cost_deletion
             int cost_insertion
-            int origin, cost, matches
+            int origin, cost, matches, score
             int length
             int ref_start
             int cur_effective_length
             bint characters_equal
+            bint is_acceptable
             # We keep only a single column of the DP matrix in memory.
             # To access the diagonal cell to the upper left,
             # we store it here before overwriting it.
@@ -412,11 +449,19 @@ cdef class Aligner:
                     else:
                         characters_equal = (s1[i-1] & s2[j-1]) != 0
                     if characters_equal:
-                        # If the characters match, skip computing costs for
+                        # If the characters match, we can skip computing costs for
                         # insertion and deletion as they are at least as high.
                         cost = diag_entry.cost
                         origin = diag_entry.origin
-                        matches = diag_entry.matches + 1
+                        # Among the optimal alignments whose edit distance is within the
+                        # maximum allowed error rate, we prefer those that have the
+                        # maximum number of matches. And among those, we want to
+                        # prefer those with mismatches over those with indels.
+                        # To achieve this, scores are as follows
+                        # - match: MATCH_SCORE
+                        # - mismatch: 0
+                        # - indel: -1
+                        score = diag_entry.score + MATCH_SCORE
                     else:
                         # Characters do not match.
                         cost_diag = diag_entry.cost + 1
@@ -427,24 +472,26 @@ cdef class Aligner:
                             # MISMATCH
                             cost = cost_diag
                             origin = diag_entry.origin
-                            matches = diag_entry.matches
+                            score = diag_entry.score
                         elif cost_insertion <= cost_deletion:
                             # INSERTION
                             cost = cost_insertion
                             origin = column[i-1].origin
-                            matches = column[i-1].matches
+                            # penalize insertions slightly
+                            score = column[i-1].score - 1
                         else:
                             # DELETION
                             cost = cost_deletion
                             origin = column[i].origin
-                            matches = column[i].matches
+                            # penalize deletions slightly
+                            score = column[i].score - 1
 
                     # Remember the current cell for next iteration
                     diag_entry = column[i]
 
                     column[i].cost = cost
                     column[i].origin = origin
-                    column[i].matches = matches
+                    column[i].score = score
                 if self.debug:
                     with gil:
                         for i in range(last + 1):
@@ -468,12 +515,28 @@ cdef class Aligner:
                         else:
                             cur_effective_length = self.effective_length
                     cost = column[m].cost
-                    matches = column[m].matches
-                    if length >= self._min_overlap and cost <= cur_effective_length * max_error_rate and (matches > best.matches or (matches == best.matches and cost < best.cost)):
-                        # update
+                    score = column[m].score
+                    matches = score_to_matches(score)
+                    origin = column[m].origin
+                    is_acceptable = (
+                        length >= self._min_overlap
+                        and cost <= cur_effective_length * max_error_rate
+                    )
+                    if is_acceptable and (
+                        # no best match recorded so far
+                        (best.cost == m + n)
+                        # same start position, use score to judge whether this is better
+                        or (origin == best.origin and score > best.score)
+                        # different start position, only matches count
+                        or (matches > best.matches or (matches == best.matches and cost < best.cost))
+                    ):
+                        # The case "matches == best.matches and cost < best.cost" applies
+                        # when the query contains the reference twice, and where the right
+                        # occurrence contains fewer errors
+                        best.score = score
                         best.matches = matches
                         best.cost = cost
-                        best.origin = column[m].origin
+                        best.origin = origin
                         best.ref_stop = m
                         best.query_stop = j
                         if cost == 0 and matches == m:
@@ -487,7 +550,8 @@ cdef class Aligner:
             for i in range(first_i, m+1):
                 length = i + min(column[i].origin, 0)
                 cost = column[i].cost
-                matches = column[i].matches
+                score = column[i].score
+                matches = score_to_matches(score)
                 if self.wildcard_ref:
                     if length < m:
                         # Recompute effective length so that it only takes into
@@ -502,9 +566,20 @@ cdef class Aligner:
                 assert 0 <= cur_effective_length and cur_effective_length <= length
                 assert cur_effective_length <= self.effective_length
 
-                if length >= self._min_overlap and cost <= cur_effective_length * max_error_rate and (matches > best.matches or (matches == best.matches and cost < best.cost)):
-                    # update best
+                is_acceptable = (
+                    length >= self._min_overlap
+                    and cost <= cur_effective_length * max_error_rate
+                )
+                if is_acceptable and (
+                    # no best match recorded so far
+                    (best.cost == m + n)
+                    # same start position, use score to judge whether this is better
+                    or (origin == best.origin and score > best.score)
+                    # different start position, only matches count
+                    or (matches > best.matches or (matches == best.matches and cost < best.cost))
+                ):
                     best.matches = matches
+                    best.score = score
                     best.cost = cost
                     best.origin = column[i].origin
                     best.ref_stop = i

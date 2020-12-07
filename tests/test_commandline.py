@@ -1,15 +1,10 @@
-# TODO
-# test reading from standard input
-import os
-import shutil
-import sys
-import tempfile
-from io import StringIO
-import pytest
 import subprocess
+import sys
+from io import StringIO, BytesIO
+import pytest
 
 from cutadapt.__main__ import main
-from utils import assert_files_equal, datapath, cutpath, redirect_stderr
+from utils import assert_files_equal, datapath, cutpath
 
 # pytest.mark.timeout will not fail even if pytest-timeout is not installed
 try:
@@ -17,6 +12,46 @@ try:
 except ImportError:  # pragma: no cover
     raise ImportError("pytest_timeout needs to be installed")
 del _unused
+
+
+def test_does_not_close_stdout():
+    main([datapath("small.fastq")])
+    assert not sys.stdout.closed
+
+
+def test_help():
+    with pytest.raises(SystemExit) as e:
+        main(["--help"])
+    assert e.value.args[0] == 0
+
+
+def test_unknown_file_format(tmp_path):
+    path = tmp_path / "unknown_format.txt"
+    path.write_text("raw text")
+    with pytest.raises(SystemExit):
+        main([str(path)])
+
+
+def test_cores_negative():
+    with pytest.raises(SystemExit) as e:
+        main(["--cores=-1", datapath("simple.fasta")])
+    assert e.value.args[0] == 2
+    # "cannot be negative"
+
+
+def test_quiet_and_report():
+    with pytest.raises(SystemExit) as e:
+        main(["--quiet", "--report=minimal", datapath("simple.fasta")])
+    assert e.value.args[0] == 2
+    # "Options --quiet and --report cannot be used at the same time"
+
+
+def test_debug():
+    main(["--debug", "--", datapath("small.fastq")])
+
+
+def test_debug_trace():
+    main(["--debug", "--debug", "-a", "ACGT", datapath("small.fastq")])
 
 
 def test_example(run):
@@ -69,27 +104,9 @@ def test_discard_untrimmed(run):
     run('-b CAAGAT --discard-untrimmed', 'discard-untrimmed.fastq', 'small.fastq')
 
 
-@pytest.mark.skip(reason='Regression since switching to dnaio')
-def test_second_header_retained(run, cores):
-    """test if sequence name after the "+" is retained"""
-    run("--cores {} -e 0.12 -b TTAGACATATCTCCGTCG".format(cores), "plus.fastq", "plus.fastq")
-
-
-@pytest.mark.skip(reason='Regression since switching to dnaio')
-def test_length_tag_second_header(run, cores):
-    """Ensure --length-tag= also modifies the second header line"""
-    run("--cores {} -a GGCTTC --length-tag=length=".format(cores),
-        'SRR2040271_1.fastq', 'SRR2040271_1.fastq')
-
-
 def test_extensiontxtgz(run):
     """automatic recognition of "_sequence.txt.gz" extension"""
     run("-b TTAGACATATCTCCGTCG", "s_1_sequence.txt", "s_1_sequence.txt.gz")
-
-
-def test_format(run):
-    """the -f/--format parameter"""
-    run("-f fastq -b TTAGACATATCTCCGTCG", "small.fastq", "small.myownextension")
 
 
 def test_minimum_length(run):
@@ -100,13 +117,14 @@ def test_minimum_length(run):
 def test_too_short(run, tmpdir, cores):
     """--too-short-output"""
     too_short_path = str(tmpdir.join('tooshort.fa'))
-    run([
+    stats = run([
         "--cores", str(cores),
         "-m", "5",
         "-a", "TTAGACATATCTCCGTCG",
         "--too-short-output", too_short_path
     ], "minlen.fa", "lengths.fa")
     assert_files_equal(datapath('tooshort.fa'), too_short_path)
+    assert stats.too_short == 5
 
 
 def test_maximum_length(run):
@@ -117,13 +135,14 @@ def test_maximum_length(run):
 def test_too_long(run, tmpdir, cores):
     """--too-long-output"""
     too_long_path = str(tmpdir.join('toolong.fa'))
-    run([
+    stats = run([
         "--cores", str(cores),
         "-M", "5",
         "-a", "TTAGACATATCTCCGTCG",
         "--too-long-output", too_long_path
     ], "maxlen.fa", "lengths.fa")
     assert_files_equal(datapath('toolong.fa'), too_long_path)
+    assert stats.too_long == 5
 
 
 def test_length_tag(run):
@@ -206,6 +225,15 @@ def test_action_mask(run):
 
 def test_action_lowercase(run):
     run("-b CAAG -n 3 --action=lowercase", "action_lowercase.fasta", "action_lowercase.fasta")
+
+
+def test_action_retain(run):
+    run("-g GGTTAACC -a CAAG --action=retain", "action_retain.fasta", "action_retain.fasta")
+
+
+def test_action_retain_times():
+    with pytest.raises(SystemExit):
+        main(["-a", "ACGT", "--times=2", "--action=retain", datapath("small.fastq")])
 
 
 def test_gz_multiblock(run):
@@ -343,8 +371,16 @@ def test_adapter_with_u(run):
     run("-a GCCGAACUUCUUAGACUGCCUUAAGGACGU", "illumina.fastq", "illumina.fastq.gz")
 
 
-def test_bzip2(run):
-    run('-b TTAGACATATCTCCGTCG', 'small.fastq', 'small.fastq.bz2')
+def test_bzip2_input(run, cores):
+    run(["--cores", str(cores), "-a", "TTAGACATATCTCCGTCG"], "small.fastq", "small.fastq.bz2")
+
+
+@pytest.mark.parametrize("extension", ["bz2", "xz", "gz"])
+def test_compressed_output(tmp_path, cores, extension):
+    out_path = str(tmp_path / ("small.fastq." + extension))
+    params = [
+        "--cores", str(cores), "-a", "TTAGACATATCTCCGTCG", "-o", out_path, datapath("small.fastq")]
+    main(params)
 
 
 if sys.version_info[:2] >= (3, 3):
@@ -358,14 +394,12 @@ def test_xz(run):
 
 def test_no_args():
     with pytest.raises(SystemExit):
-        with redirect_stderr():
-            main([])
+        main([])
 
 
 def test_two_fastqs():
     with pytest.raises(SystemExit):
-        with redirect_stderr():
-            main([datapath('paired.1.fastq'), datapath('paired.2.fastq')])
+        main([datapath('paired.1.fastq'), datapath('paired.2.fastq')])
 
 
 def test_anchored_no_indels(run):
@@ -386,8 +420,7 @@ def test_anchored_no_indels_wildcard_adapt(run):
 
 def test_non_iupac_characters(run):
     with pytest.raises(SystemExit):
-        with redirect_stderr():
-            main(['-a', 'ZACGT', datapath('small.fastq')])
+        main(['-a', 'ZACGT', datapath('small.fastq')])
 
 
 def test_unconditional_cut_front(run):
@@ -443,15 +476,24 @@ def test_adapter_file_empty_name(run):
     run('-N -a file:' + datapath('adapter-empty-name.fasta'), 'illumina.fastq', 'illumina.fastq.gz')
 
 
-def test_demultiplex():
-    tempdir = tempfile.mkdtemp(prefix='cutadapt-tests.')
-    multiout = os.path.join(tempdir, 'tmp-demulti.{name}.fasta')
-    params = ['-a', 'first=AATTTCAGGAATT', '-a', 'second=GTTCTCTAGTTCT', '-o', multiout, datapath('twoadapters.fasta')]
-    assert main(params) is None
-    assert_files_equal(cutpath('twoadapters.first.fasta'), multiout.format(name='first'))
-    assert_files_equal(cutpath('twoadapters.second.fasta'), multiout.format(name='second'))
-    assert_files_equal(cutpath('twoadapters.unknown.fasta'), multiout.format(name='unknown'))
-    shutil.rmtree(tempdir)
+@pytest.mark.parametrize("ext", ["", ".gz"])
+def test_demultiplex(cores, tmp_path, ext):
+    multiout = str(tmp_path / 'tmp-demulti.{name}.fasta') + ext
+    params = [
+        '--cores', str(cores),
+        '-a', 'first=AATTTCAGGAATT',
+        '-a', 'second=GTTCTCTAGTTCT',
+        '-o', multiout,
+        datapath('twoadapters.fasta'),
+    ]
+    main(params)
+    for name in ("first", "second", "unknown"):
+        actual = multiout.format(name=name)
+        if ext == ".gz":
+            subprocess.run(["gzip", "-d", actual], check=True)
+            actual = actual[:-3]
+        expected = cutpath("twoadapters.{name}.fasta".format(name=name))
+        assert_files_equal(expected, actual)
 
 
 def test_multiple_fake_anchored_adapters(run):
@@ -475,27 +517,31 @@ def test_multiple_suffix_adapters_noindels(run):
 
 
 def test_max_n(run):
-    run('--max-n 0', 'maxn0.fasta', 'maxn.fasta')
-    run('--max-n 1', 'maxn1.fasta', 'maxn.fasta')
-    run('--max-n 2', 'maxn2.fasta', 'maxn.fasta')
-    run('--max-n 0.2', 'maxn0.2.fasta', 'maxn.fasta')
-    run('--max-n 0.4', 'maxn0.4.fasta', 'maxn.fasta')
+    assert run('--max-n 0', 'maxn0.fasta', 'maxn.fasta').too_many_n == 4
+    assert run('--max-n 1', 'maxn1.fasta', 'maxn.fasta').too_many_n == 2
+    assert run('--max-n 2', 'maxn2.fasta', 'maxn.fasta').too_many_n == 1
+    assert run('--max-n 0.2', 'maxn0.2.fasta', 'maxn.fasta').too_many_n == 3
+    assert run('--max-n 0.4', 'maxn0.4.fasta', 'maxn.fasta').too_many_n == 2
 
 
 def test_quiet_is_quiet():
     captured_standard_output = StringIO()
     captured_standard_error = StringIO()
+    setattr(captured_standard_output, "buffer", BytesIO())
+    setattr(captured_standard_error, "buffer", BytesIO())
     old_stdout = sys.stdout
     old_stderr = sys.stderr
     try:
         sys.stdout = captured_standard_output
         sys.stderr = captured_standard_error
-        main(['-o', '/dev/null', '--quiet', '-a', 'XXXX', datapath('illumina.fastq.gz')])
+        main(['-o', '/dev/null', '--quiet', datapath('small.fastq')])
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
     assert captured_standard_output.getvalue() == ''
     assert captured_standard_error.getvalue() == ''
+    assert getattr(captured_standard_output, "buffer").getvalue() == b''
+    assert getattr(captured_standard_output, "buffer").getvalue() == b''
 
 
 def test_x_brace_notation():
@@ -530,22 +576,31 @@ def test_linked_discard_untrimmed_g(run):
     run('-g AAAAAAAAAA...TTTTTTTTTT --discard-untrimmed', 'linked-discard-g.fasta', 'linked.fasta')
 
 
+def test_linked_lowercase(run):
+    run('-a ^AACCGGTTTT...GGGGGGG$ -a ^AAAA...TTTT$ --times=2 --action=lowercase',
+        'linked-lowercase.fasta', 'linked.fasta')
+
+
+def test_linked_info_file(tmpdir):
+    info_path = str(tmpdir.join('info.txt'))
+    main(['-a linkedadapter=^AAAAAAAAAA...TTTTTTTTTT', '--info-file', info_path,
+        '-o', str(tmpdir.join('out.fasta')), datapath('linked.fasta')])
+    assert_files_equal(cutpath('linked-info.txt'), info_path)
+
+
 def test_linked_anywhere():
     with pytest.raises(SystemExit):
-        with redirect_stderr():
-            main(['-b', 'AAA...TTT', datapath('linked.fasta')])
+        main(['-b', 'AAA...TTT', datapath('linked.fasta')])
 
 
 def test_anywhere_anchored_5p():
     with pytest.raises(SystemExit):
-        with redirect_stderr():
-            main(['-b', '^AAA', datapath('small.fastq')])
+        main(['-b', '^AAA', datapath('small.fastq')])
 
 
 def test_anywhere_anchored_3p():
     with pytest.raises(SystemExit):
-        with redirect_stderr():
-            main(['-b', 'TTT$', datapath('small.fastq')])
+        main(['-b', 'TTT$', datapath('small.fastq')])
 
 
 def test_fasta(run):
@@ -562,10 +617,6 @@ def test_length(run):
 
 def test_negative_length(run):
     run('--length -5', 'shortened-negative.fastq', 'small.fastq')
-
-
-def test_run_cutadapt_process():
-    subprocess.check_call(['cutadapt', '--version'])
 
 
 @pytest.mark.timeout(0.5)
@@ -590,7 +641,8 @@ def test_adapterx(run):
 
 
 def test_discard_casava(run):
-    run('--discard-casava', 'casava.fastq', 'casava.fastq')
+    stats = run('--discard-casava', 'casava.fastq', 'casava.fastq')
+    assert stats.casava_filtered == 1
 
 
 def test_underscore(run):
@@ -617,72 +669,6 @@ def test_paired_separate(run):
     run("-a CAGTGGAGTA", "paired-separate.2.fastq", "paired.2.fastq")
 
 
-def test_run_as_module():
-    """Check that "python3 -m cutadapt ..." works"""
-    import subprocess
-    from cutadapt import __version__
-    py = subprocess.Popen([sys.executable, "-m", "cutadapt", "--version"], stdout=subprocess.PIPE)
-    assert py.communicate()[0].decode().strip() == __version__
-
-
-def test_standard_input_pipe(tmpdir, cores):
-    """Read FASTQ from standard input"""
-
-    import subprocess
-    out_path = str(tmpdir.join("out.fastq"))
-    in_path = datapath("small.fastq")
-    # Use 'cat' to simulate that no file name is available for stdin
-    cat = subprocess.Popen(["cat", in_path], stdout=subprocess.PIPE)
-    py = subprocess.Popen([
-        sys.executable, "-m", "cutadapt", "--cores", str(cores),
-        "-a", "TTAGACATATCTCCGTCG", "-o", out_path, "-"],
-        stdin=cat.stdout)
-    _ = py.communicate()
-    cat.stdout.close()
-    _ = py.communicate()[0]
-    assert_files_equal(cutpath("small.fastq"), out_path)
-
-
-def test_standard_output(tmpdir, cores):
-    """Write FASTQ to standard output (not using --output/-o option)"""
-
-    import subprocess
-    out_path = str(tmpdir.join("out.fastq"))
-    with open(out_path, "w") as out_file:
-        py = subprocess.Popen([
-            sys.executable, "-m", "cutadapt", "--cores", str(cores),
-            "-a", "TTAGACATATCTCCGTCG", datapath("small.fastq")],
-            stdout=out_file)
-        _ = py.communicate()
-    assert_files_equal(cutpath("small.fastq"), out_path)
-
-
-def test_explicit_standard_output(tmpdir, cores):
-    """Write FASTQ to standard output (using "-o -")"""
-
-    out_path = str(tmpdir.join("out.fastq"))
-    with open(out_path, "w") as out_file:
-        py = subprocess.Popen([
-            sys.executable, "-m", "cutadapt", "-o", "-", "--cores", str(cores),
-            "-a", "TTAGACATATCTCCGTCG", datapath("small.fastq")],
-            stdout=out_file)
-        _ = py.communicate()
-    assert_files_equal(cutpath("small.fastq"), out_path)
-
-
-def test_force_fasta_output(tmpdir, cores):
-    """Write FASTA to standard output even on FASTQ input"""
-
-    out_path = str(tmpdir.join("out.fasta"))
-    with open(out_path, "w") as out_file:
-        py = subprocess.Popen([
-            sys.executable, "-m", "cutadapt", "--fasta", "-o", "-", "--cores", str(cores),
-            "-a", "TTAGACATATCTCCGTCG", datapath("small.fastq")],
-            stdout=out_file)
-        _ = py.communicate()
-    assert_files_equal(cutpath("small.fasta"), out_path)
-
-
 def test_empty_read_with_wildcard_in_adapter(run):
     run("-g CWC", "empty.fastq", "empty.fastq")
 
@@ -695,3 +681,52 @@ def test_print_progress_to_tty(tmpdir, mocker):
 def test_adapter_order(run):
     run("-g ^AAACC -a CCGGG", "adapterorder-ga.fasta", "adapterorder.fasta")
     run("-a CCGGG -g ^AAACC", "adapterorder-ag.fasta", "adapterorder.fasta")
+
+
+def test_reverse_complement_normalized(run):
+    stats = run(
+        "--revcomp --no-index -g ^TTATTTGTCT -g ^TCCGCACTGG",
+        "revcomp-single-normalize.fastq",
+        "revcomp.1.fastq",
+    )
+    assert stats.n == 6
+    assert stats.reverse_complemented == 2
+
+
+def test_reverse_complement_and_info_file(run, tmp_path, cores):
+    info_path = str(tmp_path / "info.txt")
+    run(
+        [
+            "--revcomp",
+            "--no-index",
+            "-g",
+            "^TTATTTGTCT",
+            "-g",
+            "^TCCGCACTGG",
+            "--info-file",
+            info_path,
+        ],
+        "revcomp-single-normalize.fastq",
+        "revcomp.1.fastq",
+    )
+    with open(info_path) as f:
+        lines = f.readlines()
+    assert len(lines) == 6
+    assert lines[0].split("\t")[0] == "read1/1"
+    assert lines[1].split("\t")[0] == "read2/1 rc"
+
+
+def test_max_expected_errors(run, cores):
+    stats = run("--max-ee=0.9", "maxee.fastq", "maxee.fastq")
+    assert stats.too_many_expected_errors == 2
+
+
+def test_max_expected_errors_fasta(tmp_path):
+    path = tmp_path / "input.fasta"
+    path.write_text(">read\nACGTACGT\n")
+    main(["--max-ee=0.001", "-o", "/dev/null", str(path)])
+
+
+def test_warn_if_en_dashes_used():
+    with pytest.raises(SystemExit):
+        main(["–q", "25", "-o", "/dev/null", "in.fastq"])

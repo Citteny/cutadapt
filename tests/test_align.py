@@ -5,7 +5,10 @@ from cutadapt.align import (
     PrefixComparer,
     SuffixComparer,
     hamming_sphere,
+    edit_environment,
     SEMIGLOBAL,
+    edit_distance,
+    naive_edit_environment,
 )
 from cutadapt.adapters import Where
 
@@ -95,7 +98,7 @@ def test_compare_prefixes():
         assert result == (0, 10, 0, 10, 10, 0)
 
     for s in WILDCARD_SEQUENCES:
-        for t in WILDCARD_SEQUENCES:
+        for t in WILDCARD_SEQUENCES:  # FIXME what is this t doing?
             r = s + 'GCCAGGG'
             result = compare_prefixes(s, r, )
             assert result == (0, 10, 0, 10, 10, 0)
@@ -108,6 +111,23 @@ def test_compare_prefixes():
         for wildc_query in (False, True):
             result = compare_prefixes('CCCXTTXATC', r, wildcard_ref=wildc_ref, wildcard_query=wildc_query)
             assert result == (0, 10, 0, 10, 8, 2)
+
+
+def test_n_wildcard_in_ref_matches_n_wildcard_in_query_prefix():
+    # With allowed wildcards in the ref, an N wildcard in the ref should never count as an error,
+    # even if matched against an N wildcard in the query while wildcard_query is False
+    # Issue #453
+    match = compare_prefixes("NNACGT", "NTACGTAA", wildcard_ref=True, wildcard_query=False)
+    assert match == (0, 6, 0, 6, 6, 0)
+
+    match = compare_prefixes("NNACGT", "YTACGTAA", wildcard_ref=True, wildcard_query=False)
+    assert match == (0, 6, 0, 6, 6, 0)
+
+
+def test_n_wildcard_in_ref_matches_n_wildcard_in_query_back():
+    aligner = Aligner("NNACGT", max_error_rate=0, wildcard_ref=True, flags=Where.BACK.value)
+    match = aligner.locate("AAANTACGTAAA")
+    assert match == (0, 6, 3, 9, 6, 0)
 
 
 def test_compare_suffixes():
@@ -250,3 +270,29 @@ def test_hamming_sphere(sk):
     assert len(result) == 3 ** k * binomial(len(s), k)
     for t in result:
         assert hamming_distance(s, t) == k
+
+
+@pytest.mark.parametrize("sk", [
+    ('', 0),
+    ('A', 0),
+    ('AAA', 1),
+    ('ACC', 2),
+    ('TCATTA', 3),
+    ('AAAAAAAA', 1),
+    # skip these since the naive function is very slow
+    # ('A'*10, 2),
+    # ('A'*10, 3),
+    # ('A'*15, 2),
+    # ('A'*6, 4),
+])
+def test_edit_environment(sk):
+    s, k = sk
+    result = list(edit_environment(s, k))
+    strings, distances, matches = zip(*result)
+    naive = set(naive_edit_environment(s, k))
+    assert len(set(strings)) == len(strings)
+    assert set(strings) == naive
+    for t, dist, m in result:
+        assert edit_distance(s, t) == dist
+        assert m <= len(s), (s, t, dist)
+        assert m <= len(t), (s, t, dist)

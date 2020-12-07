@@ -1,13 +1,13 @@
 from dnaio import Sequence
-from cutadapt.adapters import Adapter, Where
-from cutadapt.modifiers import AdapterCutter
+from cutadapt.adapters import BackAdapter, AnywhereAdapter
+from cutadapt.modifiers import AdapterCutter, ModificationInfo
 
 
 def test_statistics():
     read = Sequence('name', 'AAAACCCCAAAA')
-    adapters = [Adapter('CCCC', Where.BACK, max_error_rate=0.1)]
+    adapters = [BackAdapter("CCCC", max_errors=0.1)]
     cutter = AdapterCutter(adapters, times=3)
-    cutter(read, [])
+    cutter(read, ModificationInfo(read))
     # TODO make this a lot simpler
     trimmed_bp = 0
     for adapter in adapters:
@@ -25,11 +25,11 @@ def test_end_trim_with_mismatch():
     the hit and so the match is considered good. An insertion or substitution
     at the same spot is not a match.
     """
-    adapter = Adapter('TCGATCGATCGAT', Where.BACK, max_error_rate=0.1)
+    adapter = BackAdapter("TCGATCGATCGAT", max_errors=0.1)
 
     read = Sequence('foo1', 'AAAAAAAAAAATCGTCGATC')
     cutter = AdapterCutter([adapter], times=1)
-    trimmed_read = cutter(read, [])
+    trimmed_read = cutter(read, ModificationInfo(read))
 
     assert trimmed_read.sequence == 'AAAAAAAAAAA'
     assert cutter.adapter_statistics[adapter].back.lengths == {9: 1}
@@ -39,14 +39,14 @@ def test_end_trim_with_mismatch():
 
     read = Sequence('foo2', 'AAAAAAAAAAATCGAACGA')
     cutter = AdapterCutter([adapter], times=1)
-    trimmed_read = cutter(read, [])
+    trimmed_read = cutter(read, ModificationInfo(read))
 
     assert trimmed_read.sequence == read.sequence
     assert cutter.adapter_statistics[adapter].back.lengths == {}
 
 
 def test_anywhere_with_errors():
-    adapter = Adapter('CCGCATTTAG', Where.ANYWHERE, max_error_rate=0.1)
+    adapter = AnywhereAdapter("CCGCATTTAG", max_errors=0.1)
     for seq, expected_trimmed in (
         ('AACCGGTTccgcatttagGATC', 'AACCGGTT'),
         ('AACCGGTTccgcgtttagGATC', 'AACCGGTT'),  # one mismatch
@@ -57,5 +57,5 @@ def test_anywhere_with_errors():
     ):
         read = Sequence('foo', seq)
         cutter = AdapterCutter([adapter], times=1)
-        trimmed_read = cutter(read, [])
+        trimmed_read = cutter(read, ModificationInfo(read))
         assert trimmed_read.sequence == expected_trimmed

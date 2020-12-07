@@ -1,13 +1,19 @@
 """
 Routines for printing a report.
 """
+import sys
 from io import StringIO
 import textwrap
-from .adapters import Where, EndStatistics, ADAPTER_TYPE_NAMES
-from .modifiers import QualityTrimmer, NextseqQualityTrimmer, AdapterCutter, PairedAdapterCutter
-from .filters import (NoFilter, PairedNoFilter, TooShortReadFilter, TooLongReadFilter,
-    PairedDemultiplexer, CombinatorialDemultiplexer, Demultiplexer, NContentFilter, InfoFileWriter,
-    WildcardFileWriter, RestFileWriter)
+from collections import Counter
+from typing import Any, Optional, List
+from .adapters import (
+    EndStatistics, AdapterStatistics, FrontAdapter, NonInternalFrontAdapter, PrefixAdapter,
+    BackAdapter, NonInternalBackAdapter, SuffixAdapter, AnywhereAdapter, LinkedAdapter,
+)
+from .modifiers import (SingleEndModifier, PairedModifier, QualityTrimmer, NextseqQualityTrimmer,
+    AdapterCutter, PairedAdapterCutter, ReverseComplementer)
+from .filters import (WithStatistics, TooShortReadFilter, TooLongReadFilter, NContentFilter,
+    CasavaFilter, MaximumExpectedErrorsFilter)
 
 
 def safe_divide(numerator, denominator):
@@ -26,23 +32,27 @@ def add_if_not_none(a, b):
 
 
 class Statistics:
-    def __init__(self):
+    def __init__(self) -> None:
         """
         """
-        self.paired = None
+        self.paired = None  # type: Optional[bool]
+        self.did_quality_trimming = None  # type: Optional[bool]
         self.too_short = None
         self.too_long = None
         self.too_many_n = None
-        self.did_quality_trimming = None
+        self.too_many_expected_errors = None
+        self.casava_filtered = None
+        self.reverse_complemented = None  # type: Optional[int]
         self.n = 0
         self.written = 0
         self.total_bp = [0, 0]
         self.written_bp = [0, 0]
+        self.written_lengths = [Counter(), Counter()]  # type: List[Counter]
         self.with_adapters = [0, 0]
         self.quality_trimmed_bp = [0, 0]
-        self.adapter_stats = [[], []]
+        self.adapter_stats = [[], []]  # type: List[List[AdapterStatistics]]
 
-    def __iadd__(self, other):
+    def __iadd__(self, other: Any):
         self.n += other.n
         self.written += other.written
 
@@ -55,12 +65,18 @@ class Statistics:
         elif self.did_quality_trimming != other.did_quality_trimming:
             raise ValueError('Incompatible Statistics: did_quality_trimming is not equal')
 
+        self.reverse_complemented = add_if_not_none(
+            self.reverse_complemented, other.reverse_complemented)
         self.too_short = add_if_not_none(self.too_short, other.too_short)
         self.too_long = add_if_not_none(self.too_long, other.too_long)
         self.too_many_n = add_if_not_none(self.too_many_n, other.too_many_n)
+        self.too_many_expected_errors = add_if_not_none(
+            self.too_many_expected_errors, other.too_many_expected_errors)
+        self.casava_filtered = add_if_not_none(self.casava_filtered, other.casava_filtered)
         for i in (0, 1):
             self.total_bp[i] += other.total_bp[i]
             self.written_bp[i] += other.written_bp[i]
+            self.written_lengths[i] += other.written_lengths[i]
             self.with_adapters[i] += other.with_adapters[i]
             self.quality_trimmed_bp[i] += other.quality_trimmed_bp[i]
             if self.adapter_stats[i] and other.adapter_stats[i]:
@@ -97,27 +113,32 @@ class Statistics:
         return self
 
     def _collect_writer(self, w):
-        if isinstance(w, (InfoFileWriter, RestFileWriter, WildcardFileWriter)):
-            return
-        elif isinstance(w, (NoFilter, PairedNoFilter, PairedDemultiplexer,
-                CombinatorialDemultiplexer, Demultiplexer)):
-            self.written += w.written
-            self.written_bp[0] += w.written_bp[0]
-            self.written_bp[1] += w.written_bp[1]
-        elif isinstance(w.filter, TooShortReadFilter):
-            self.too_short = w.filtered
-        elif isinstance(w.filter, TooLongReadFilter):
-            self.too_long = w.filtered
-        elif isinstance(w.filter, NContentFilter):
-            self.too_many_n = w.filtered
+        if isinstance(w, WithStatistics):
+            self.written += w.written_reads()
+            written_bp = w.written_bp()
+            written_lengths = w.written_lengths()
+            for i in 0, 1:
+                self.written_bp[i] += written_bp[i]
+                self.written_lengths[i] += written_lengths[i]
+        if hasattr(w, "filter"):
+            if isinstance(w.filter, TooShortReadFilter):
+                self.too_short = w.filtered
+            elif isinstance(w.filter, TooLongReadFilter):
+                self.too_long = w.filtered
+            elif isinstance(w.filter, NContentFilter):
+                self.too_many_n = w.filtered
+            elif isinstance(w.filter, MaximumExpectedErrorsFilter):
+                self.too_many_expected_errors = w.filtered
+            elif isinstance(w.filter, CasavaFilter):
+                self.casava_filtered = w.filtered
 
-    def _collect_modifier(self, m):
+    def _collect_modifier(self, m: SingleEndModifier):
         if isinstance(m, PairedAdapterCutter):
             for i in 0, 1:
                 self.with_adapters[i] += m.with_adapters
                 self.adapter_stats[i] = list(m.adapter_statistics[i].values())
             return
-        if getattr(m, 'paired', False):
+        if isinstance(m, PairedModifier):
             modifiers_list = [(0, m._modifier1), (1, m._modifier2)]
         else:
             modifiers_list = [(0, m)]
@@ -128,6 +149,10 @@ class Statistics:
             elif isinstance(modifier, AdapterCutter):
                 self.with_adapters[i] += modifier.with_adapters
                 self.adapter_stats[i] = list(modifier.adapter_statistics.values())
+            elif isinstance(modifier, ReverseComplementer):
+                self.with_adapters[i] += modifier.adapter_cutter.with_adapters
+                self.adapter_stats[i] = list(modifier.adapter_cutter.adapter_statistics.values())
+                self.reverse_complemented = modifier.reverse_complemented
 
     @property
     def total(self):
@@ -158,6 +183,10 @@ class Statistics:
         return safe_divide(self.total_written_bp, self.total)
 
     @property
+    def reverse_complemented_fraction(self):
+        return safe_divide(self.reverse_complemented, self.n)
+
+    @property
     def too_short_fraction(self):
         return safe_divide(self.too_short, self.n)
 
@@ -169,11 +198,19 @@ class Statistics:
     def too_many_n_fraction(self):
         return safe_divide(self.too_many_n, self.n)
 
+    @property
+    def too_many_expected_errors_fraction(self):
+        return safe_divide(self.too_many_expected_errors, self.n)
+
+    @property
+    def casava_filtered_fraction(self):
+        return safe_divide(self.casava_filtered, self.n)
+
 
 def error_ranges(adapter_statistics: EndStatistics):
     length = adapter_statistics.effective_length
     error_rate = adapter_statistics.max_error_rate
-    prev = 0
+    prev = 1
     s = ""
     for errors in range(1, int(error_rate * length) + 1):
         r = int(errors / error_rate)
@@ -258,11 +295,11 @@ class AdjacentBaseStatistics:
         if self.should_warn:
             print('WARNING:', file=sio)
             print('    The adapter is preceded by "{}" extremely often.'.format(self._warnbase), file=sio)
-            print("    The provided adapter sequence could be incomplete at its 3' end.", file=sio)
+            print("    The provided adapter sequence could be incomplete at its 5' end.", file=sio)
         return sio.getvalue()
 
 
-def full_report(stats, time, gc_content) -> str:
+def full_report(stats: Statistics, time: float, gc_content: float) -> str:  # noqa: C901
     """Print report to standard output."""
     if stats.n == 0:
         return "No reads processed!"
@@ -273,8 +310,12 @@ def full_report(stats, time, gc_content) -> str:
         kwargs['file'] = sio
         print(*args, **kwargs)
 
-    print_s("Finished in {:.2F} s ({:.0F} us/read; {:.2F} M reads/minute).".format(
-        time, 1E6 * time / stats.n, stats.n / time * 60 / 1E6))
+    if sys.version_info[:2] <= (3, 6):
+        micro = "u"
+    else:
+        micro = "µ"
+    print_s("Finished in {:.2F} s ({:.0F} {}s/read; {:.2F} M reads/minute).".format(
+        time, 1E6 * time / stats.n, micro, stats.n / time * 60 / 1E6))
 
     report = "\n=== Summary ===\n\n"
     if stats.paired:
@@ -288,12 +329,22 @@ def full_report(stats, time, gc_content) -> str:
         Total reads processed:           {o.n:13,d}
         Reads with adapters:             {o.with_adapters[0]:13,d} ({o.with_adapters_fraction[0]:.1%})
         """)
+    if stats.reverse_complemented is not None:
+        report += "Reverse-complemented:            " \
+                  "{o.reverse_complemented:13,d} ({o.reverse_complemented_fraction:.1%})\n"
+
     if stats.too_short is not None:
         report += "{pairs_or_reads} that were too short:       {o.too_short:13,d} ({o.too_short_fraction:.1%})\n"
     if stats.too_long is not None:
         report += "{pairs_or_reads} that were too long:        {o.too_long:13,d} ({o.too_long_fraction:.1%})\n"
     if stats.too_many_n is not None:
         report += "{pairs_or_reads} with too many N:           {o.too_many_n:13,d} ({o.too_many_n_fraction:.1%})\n"
+    if stats.too_many_expected_errors is not None:
+        report += "{pairs_or_reads} with too many exp. errors: " \
+                  "{o.too_many_expected_errors:13,d} ({o.too_many_expected_errors_fraction:.1%})\n"
+    if stats.casava_filtered is not None:
+        report += "{pairs_or_reads} failed CASAVA filter:      " \
+                  "{o.casava_filtered:13,d} ({o.casava_filtered_fraction:.1%})\n"
 
     report += textwrap.dedent("""\
     {pairs_or_reads} written (passing filters): {o.written:13,d} ({o.written_fraction:.1%})
@@ -324,12 +375,12 @@ def full_report(stats, time, gc_content) -> str:
             total_front = sum(adapter_statistics.front.lengths.values())
             total_back = sum(adapter_statistics.back.lengths.values())
             total = total_front + total_back
-            where = adapter_statistics.where
-            where_backs = (Where.BACK, Where.BACK_NOT_INTERNAL, Where.SUFFIX)
-            where_fronts = (Where.FRONT, Where.FRONT_NOT_INTERNAL, Where.PREFIX)
-            assert (where in (Where.ANYWHERE, Where.LINKED)
-                or (where in where_backs and total_front == 0)
-                or (where in where_fronts and total_back == 0)), (where, total_front, total_back)
+            reverse_complemented = adapter_statistics.reverse_complemented
+            adapter = adapter_statistics.adapter
+            if isinstance(adapter, (BackAdapter, NonInternalBackAdapter, SuffixAdapter)):
+                assert total_front == 0
+            if isinstance(adapter, (FrontAdapter, NonInternalFrontAdapter, PrefixAdapter)):
+                assert total_back == 0
 
             if stats.paired:
                 extra = 'First read: ' if which_in_pair == 0 else 'Second read: '
@@ -339,7 +390,7 @@ def full_report(stats, time, gc_content) -> str:
             print_s("=" * 3, extra + "Adapter", adapter_statistics.name, "=" * 3)
             print_s()
 
-            if where is Where.LINKED:
+            if isinstance(adapter, LinkedAdapter):
                 print_s("Sequence: {}...{}; Type: linked; Length: {}+{}; "
                     "5' trimmed: {} times; 3' trimmed: {} times".format(
                         adapter_statistics.front.sequence,
@@ -348,13 +399,17 @@ def full_report(stats, time, gc_content) -> str:
                         len(adapter_statistics.back.sequence),
                         total_front, total_back))
             else:
-                print_s("Sequence: {}; Type: {}; Length: {}; Trimmed: {} times.".
-                    format(adapter_statistics.front.sequence, ADAPTER_TYPE_NAMES[adapter_statistics.where],
-                        len(adapter_statistics.front.sequence), total))
+                print_s("Sequence: {}; Type: {}; Length: {}; Trimmed: {} times".
+                    format(adapter_statistics.front.sequence, adapter.description,
+                        len(adapter_statistics.front.sequence), total), end="")
+            if stats.reverse_complemented is not None:
+                print_s("; Reverse-complemented: {} times".format(reverse_complemented))
+            else:
+                print_s()
             if total == 0:
                 print_s()
                 continue
-            if where is Where.ANYWHERE:
+            if isinstance(adapter, AnywhereAdapter):
                 print_s(total_front, "times, it overlapped the 5' end of a read")
                 print_s(total_back, "times, it overlapped the 3' end or was within the read")
                 print_s()
@@ -364,7 +419,7 @@ def full_report(stats, time, gc_content) -> str:
                 print_s()
                 print_s("Overview of removed sequences (3' or within)")
                 print_s(histogram(adapter_statistics.back, stats.n, gc_content))
-            elif where is Where.LINKED:
+            elif isinstance(adapter, LinkedAdapter):
                 print_s()
                 print_s(error_ranges(adapter_statistics.front))
                 print_s(error_ranges(adapter_statistics.back))
@@ -373,13 +428,13 @@ def full_report(stats, time, gc_content) -> str:
                 print_s()
                 print_s("Overview of removed sequences at 3' end")
                 print_s(histogram(adapter_statistics.back, stats.n, gc_content))
-            elif where in (Where.FRONT, Where.PREFIX, Where.FRONT_NOT_INTERNAL):
+            elif isinstance(adapter, (FrontAdapter, NonInternalFrontAdapter, PrefixAdapter)):
                 print_s()
                 print_s(error_ranges(adapter_statistics.front))
                 print_s("Overview of removed sequences")
                 print_s(histogram(adapter_statistics.front, stats.n, gc_content))
             else:
-                assert where in (Where.BACK, Where.SUFFIX, Where.BACK_NOT_INTERNAL)
+                assert isinstance(adapter, (BackAdapter, NonInternalBackAdapter, SuffixAdapter))
                 print_s()
                 print_s(error_ranges(adapter_statistics.back))
                 base_stats = AdjacentBaseStatistics(adapter_statistics.back.adjacent_bases)
@@ -396,8 +451,10 @@ def full_report(stats, time, gc_content) -> str:
     return sio.getvalue().rstrip()
 
 
-def minimal_report(stats, time, gc_content) -> str:
+def minimal_report(stats: Statistics, time: float, gc_content: float) -> str:
     """Create a minimal tabular report suitable for concatenation"""
+    _ = time
+    _ = gc_content
 
     def none(value):
         return 0 if value is None else value
@@ -424,7 +481,7 @@ def minimal_report(stats, time, gc_content) -> str:
     warning = False
     for which_in_pair in (0, 1):
         for adapter_statistics in stats.adapter_stats[which_in_pair]:
-            if adapter_statistics.where in (Where.BACK, Where.SUFFIX, Where.BACK_NOT_INTERNAL):
+            if isinstance(adapter_statistics.adapter, (BackAdapter, NonInternalBackAdapter, SuffixAdapter)):
                 if AdjacentBaseStatistics(adapter_statistics.back.adjacent_bases).should_warn:
                     warning = True
                     break

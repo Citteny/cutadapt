@@ -6,6 +6,17 @@ import logging
 REPORT = 25
 
 
+class CrashingHandler(logging.StreamHandler):
+
+    def emit(self, record):
+        """Unlike the method it overrides, this will not catch exceptions"""
+        msg = self.format(record)
+        stream = self.stream
+        stream.write(msg)
+        stream.write(self.terminator)
+        self.flush()
+
+
 class NiceFormatter(logging.Formatter):
     """
     Do not prefix "INFO:" to info-level log messages (but do it for all other
@@ -19,7 +30,7 @@ class NiceFormatter(logging.Formatter):
         return super().format(record)
 
 
-def setup_logging(logger, stdout=False, minimal=False, quiet=False, debug=False):
+def setup_logging(logger, stdout=False, minimal=False, quiet=False, debug=0):
     """
     Attach handler to the global logger object
     """
@@ -28,12 +39,10 @@ def setup_logging(logger, stdout=False, minimal=False, quiet=False, debug=False)
     # INFO level (and the ERROR level would give us an 'ERROR:' prefix).
     logging.addLevelName(REPORT, 'REPORT')
 
-    # Due to backwards compatibility, logging output is sent to standard output
-    # instead of standard error if the -o option is used.
-    stream_handler = logging.StreamHandler(sys.stdout if stdout else sys.stderr)
+    stream_handler = CrashingHandler(sys.stdout if stdout else sys.stderr)
     stream_handler.setFormatter(NiceFormatter())
     # debug overrides quiet overrides minimal
-    if debug:
+    if debug > 0:
         level = logging.DEBUG
     elif quiet:
         level = logging.ERROR
